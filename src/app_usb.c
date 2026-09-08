@@ -34,7 +34,7 @@ const uint8_t *pDescr;
 #define DevEP0SIZE  0x40
 // 设备描述符
 const uint8_t MyDevDescr[] = { 0x12,0x01,0x10,0x01,0xFF,0x00,0x00,DevEP0SIZE,
-                             0x86,0x1A,0x23,0x75,0x63,0x02,0x00,0x02,
+                             0x48,0x43,0xE0,0x55,0x63,0x02,0x00,0x02,
                              0x00,0x01 };
 // 配置描述符
 const uint8_t MyCfgDescr[] = {   0x09,0x02,0x27,0x00,0x01,0x01,0x00,0x80,0xf0,              //配置描述符，接口描述符,端点描述符
@@ -47,7 +47,7 @@ const uint8_t MyLangDescr[] = { 0x04, 0x03, 0x09, 0x04 };
 // 厂家信息
 const uint8_t MyManuInfo[] = { 0x0E, 0x03, 'w', 0, 'c', 0, 'h', 0, '.', 0, 'c', 0, 'n', 0 };
 // 产品信息
-const uint8_t MyProdInfo[] = { 0x0C, 0x03, 'C', 0, 'H', 0, '5', 0, '7', 0, 'x', 0 };
+const uint8_t MyProdInfo[] = { 0x0C, 0x03, 'C', 0, 'H', 0, '5', 0, '8', 0, 'x', 0 };
 /*产品描述符*/
 const uint8_t StrDesc[28] =
 {
@@ -56,6 +56,28 @@ const uint8_t StrDesc[28] =
   0x53,0x00,0x65,0x00,0x72,0x00,0x69,0x00,
   0x61,0x00,0x6C,0x00
 };
+const uint8_t SecureKeyProductStr[34] = {
+    0x22,       // bLength: 描述符长度 = 34 字节 (2 + 16*2)
+    0x03,       // bDescriptorType: 字符串描述符 (STRING)
+    // 以下为 UTF-16LE 编码的字符
+    'S', 0x00,
+    'e', 0x00,
+    'c', 0x00,
+    'u', 0x00,
+    'r', 0x00,
+    'e', 0x00,
+    'K', 0x00,
+    'e', 0x00,
+    'y', 0x00,
+    0x20, 0x00, // 空格
+    'D', 0x00,
+    'e', 0x00,
+    'v', 0x00,
+    'i', 0x00,
+    'c', 0x00,
+    'e', 0x00
+};
+
 
 const uint8_t Return1[2] = {0x31,0x00};
 const uint8_t Return2[2] = {0xC3,0x00};
@@ -358,8 +380,8 @@ void USB_DevTransProcess( void )
                     len = MyManuInfo[0];
                     break;
                   case 2 :
-                    pDescr = StrDesc;
-                    len = StrDesc[0];
+                    pDescr = SecureKeyProductStr;
+                    len = SecureKeyProductStr[0];
                     break;
                   case 0 :
                     pDescr = MyLangDescr;
