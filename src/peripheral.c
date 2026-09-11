@@ -18,6 +18,8 @@
 #include "peripheral.h"
 #include "ble_usb_service.h"
 #include "app_usb.h"
+#include "app_key.h"
+#include "app_led.h"
 
 /*********************************************************************
  * MACROS
@@ -666,6 +668,16 @@ static void peripheralStateNotificationCB(gapRole_States_t newState, gapRoleEven
  */
 static void performPeriodicTask(void)
 {
+    // 按键轮询（事件驱动消抖）
+    app_key_poll();
+    
+    // 处理按键事件
+    if (app_key_has_event()) {
+        // KEY1 按下事件
+        app_led_blink_success();
+        app_key_clear_event();
+    }
+    
     uint8_t notiData[SIMPLEPROFILE_CHAR4_LEN] = {0x88};
     peripheralChar4Notify(notiData, SIMPLEPROFILE_CHAR4_LEN);
 }

@@ -9,7 +9,9 @@
  *******************************************************************************/
 
 #ifndef _APP_USB_H
-#define _APP_USBE_H
+#define _APP_USB_H
+
+#include "stdint.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -19,7 +21,20 @@ extern "C" {
 
 extern void app_usb_init(void);
 
-extern void USBSendData( uint8_t *SendBuf, uint8_t l);
+extern void app_usb_hid_process(void);
+
+// HID IN 数据发送函数
+extern int app_usb_hid_send(const uint8_t *data, uint8_t len);
+
+// 兼容旧接口：把数据放到 HID IN 端点待发
+extern void USBSendData(uint8_t *SendBuf, uint8_t l);
+
+// 获取接收到的数据
+extern uint8_t app_usb_hid_get_data(uint8_t *buf, uint8_t *len);
+
+// 重置接收标志
+extern void app_usb_hid_reset_rx(void);
+
 /*********************************************************************
 *********************************************************************/
 
@@ -27,4 +42,4 @@ extern void USBSendData( uint8_t *SendBuf, uint8_t l);
 }
 #endif
 
-#endif /* _BLE_usb_SERVICE_H */
+#endif /* _APP_USB_H */

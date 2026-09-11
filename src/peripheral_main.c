@@ -15,6 +15,9 @@
 #include "gattprofile.h"
 #include "peripheral.h"
 #include "app_usb.h"
+#include "app_key.h"
+#include "app_led.h"
+#include "app_crypto.h"
 
 /*********************************************************************
  * GLOBAL TYPEDEFS
@@ -39,6 +42,8 @@ void Main_Circulation()
     while(1)
     {
         TMOS_SystemProcess();
+        // USB HID 处理 (Echo 测试 / 协议处理)
+        app_usb_hid_process();
     }
 }
 
@@ -70,6 +75,9 @@ int main(void)
     GAPRole_PeripheralInit();
     Peripheral_Init();
     app_usb_init();
+    app_key_init();
+    app_led_init();
+    crypto_init();
     Main_Circulation();
 }
 
