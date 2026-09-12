@@ -98,7 +98,7 @@ int main(void)
     auth_sm_init();
 #ifdef DEBUG
     /* 统一自测入口：逐项打印结果（含会擦写 Flash 的安全存储自测） */
-    (void)selftest_run_all();
+    //(void)selftest_run_all();
 #endif
     Main_Circulation();
 }

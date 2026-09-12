@@ -44,6 +44,21 @@
 #define FLAG_AT                     0x40
 #define FLAG_ED                     0x80
 
+/* GetAssertion 的 signature 输出格式：
+ *   1 = ASN.1 DER（当前默认，用于验证主机侧是否自行做了转换）
+ *   0 = raw r||s（CTAP2 / COSE RFC8152 规定的格式）
+ *
+ * ⚠️ 背景：按 CTAP2 规范，设备返回 raw r||s，转 DER 是主机（Windows/Chrome）
+ *    的职责。但实测浏览器登录报 Invalid signature，而主机侧用 fido2 做
+ *    完整服务端验证（register_complete + authenticate_complete）可以通过
+ *    —— 那个测试里转换是我们手工做的。故提供此开关做对照实验。
+ *
+ *    置 0 即回到规范行为（fido2 脚本会重新成为有效验证手段）。
+ *    也可在 platformio.ini 用 -D SK_SIG_DER=0 覆盖。 */
+#ifndef SK_SIG_DER
+#define SK_SIG_DER                  1
+#endif
+
 /* MakeCredential 请求键（CTAP 2.3 §6.1） */
 #define MC_CLIENT_DATA_HASH         0x01
 #define MC_RP                       0x02
@@ -79,7 +94,11 @@ static uint8_t   s_cred_id[CRED_ID_LEN];
 static uint8_t   s_priv[ECDSA_P256_PRIV_LEN];
 static uint8_t   s_pub[ECDSA_P256_PUB_LEN];
 static ss_cred_t s_rec;
-static uint8_t   s_sig[64];        /* GetAssertion 的 r||s（连续布局） */
+static uint8_t   s_sig[64];        /* GetAssertion 的 raw r||s（连续布局） */
+#if SK_SIG_DER
+static uint8_t   s_sig_der[80];    /* DER 编码后的签名（最长 74 字节） */
+static uint16_t  s_sig_len;        /* 实际使用的签名长度 */
+#endif
 /* authData ‖ clientDataHash 的拼接缓冲：放静态，避免在 micro-ecc 签名
  * 本就吃栈的调用链上再叠加 288 字节 */
 static uint8_t   s_signbuf[AUTHDATA_MAX + COSE_HASH_LEN];
@@ -472,6 +491,61 @@ static uint16_t ctap_build_authdata(const uint8_t *rp_id_hash,
  *          ⚠️ 取得 UP（AUTH_WAIT_GRANTED）时这里**不清状态**——清了重放时会再次要求按键。
  *          状态由 ctap_pending_poll() 在完成后统一清除。
  */
+#if SK_SIG_DER
+/*********************************************************************
+ * @fn      ctap_sig_raw2der
+ *
+ * @brief   把 raw r||s（64 字节）转成 ASN.1 DER 的 SEQUENCE{ INTEGER, INTEGER }
+ *
+ * @return  DER 长度；0 表示缓冲不足
+ *
+ * @note    DER 的 INTEGER 是**有符号**的：当 r 或 s 的最高位为 1 时，
+ *          必须在前面补一个 0x00，否则会被解成负数 —— 这是 DER 编码
+ *          最容易出错的地方（实测本设备的 r 常以 0xB6 之类开头）。
+ *          纯 C 实现，可直接被主机的标准解析器接受。
+ *********************************************************************/
+static uint16_t ctap_sig_raw2der(const uint8_t *raw, uint8_t *out, uint16_t out_max)
+{
+    const uint8_t *r = raw;
+    const uint8_t *s = raw + 32;
+    uint32_t       rlen = 32;
+    uint32_t       slen = 32;
+    uint32_t       rpad;
+    uint32_t       spad;
+    uint32_t       body;
+    uint32_t       o = 0;
+
+    /* 去掉多余的前导 0（至少保留 1 字节） */
+    while(rlen > 1 && r[32 - rlen] == 0) { rlen--; }
+    while(slen > 1 && s[32 - slen] == 0) { slen--; }
+
+    /* 最高位为 1 时补 0x00，避免被解析成负数 */
+    rpad = (r[32 - rlen] & 0x80U) ? 1U : 0U;
+    spad = (s[32 - slen] & 0x80U) ? 1U : 0U;
+
+    body = 2U + rpad + rlen + 2U + spad + slen;
+    if((2U + body) > (uint32_t)out_max)
+    {
+        return 0;
+    }
+
+    out[o++] = 0x30;                                    /* SEQUENCE */
+    out[o++] = (uint8_t)body;
+    out[o++] = 0x02;                                    /* INTEGER r */
+    out[o++] = (uint8_t)(rpad + rlen);
+    if(rpad) { out[o++] = 0x00; }
+    memcpy(out + o, r + (32 - rlen), rlen);
+    o += rlen;
+    out[o++] = 0x02;                                    /* INTEGER s */
+    out[o++] = (uint8_t)(spad + slen);
+    if(spad) { out[o++] = 0x00; }
+    memcpy(out + o, s + (32 - slen), slen);
+    o += slen;
+
+    return (uint16_t)o;
+}
+#endif /* SK_SIG_DER */
+
 static uint8_t ctap_up_gate(uint8_t need_up)
 {
     /* 客户端在 options 里声明 up=false 时，不做用户在场确认。
@@ -941,6 +1015,14 @@ static uint8_t ctap_get_assertion(const uint8_t *param, uint16_t param_len,
             memset(s_priv, 0, sizeof(s_priv));
             return CTAP_ERR_OTHER;
         }
+#if SK_SIG_DER
+        s_sig_len = ctap_sig_raw2der(s_sig, s_sig_der, sizeof(s_sig_der));
+        if(s_sig_len == 0)
+        {
+            memset(s_priv, 0, sizeof(s_priv));
+            return CTAP_ERR_OTHER;
+        }
+#endif
     }
     memset(s_priv, 0, sizeof(s_priv));
 
@@ -963,7 +1045,11 @@ static uint8_t ctap_get_assertion(const uint8_t *param, uint16_t param_len,
     if(o == CBOR_ENC_ERR) { return CTAP_ERR_OTHER; }
 
     o = cbor_put_uint(resp, resp_max, o, 3);                 /* 3: signature */
+#if SK_SIG_DER
+    o = cbor_put_bytes(resp, resp_max, o, s_sig_der, s_sig_len);
+#else
     o = cbor_put_bytes(resp, resp_max, o, s_sig, 64);
+#endif
     if(o == CBOR_ENC_ERR) { return CTAP_ERR_OTHER; }
 
     o = cbor_put_uint(resp, resp_max, o, 4);                 /* 4: user */
