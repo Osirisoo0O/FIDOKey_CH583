@@ -1,3 +1,4 @@
 .pio
 .vscode
 .reasonix
+__pycache__/

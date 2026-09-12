@@ -18,8 +18,6 @@
 #include "peripheral.h"
 #include "ble_usb_service.h"
 #include "app_usb.h"
-#include "app_key.h"
-#include "app_led.h"
 
 /*********************************************************************
  * MACROS
@@ -668,15 +666,9 @@ static void peripheralStateNotificationCB(gapRole_States_t newState, gapRoleEven
  */
 static void performPeriodicTask(void)
 {
-    // 按键轮询（事件驱动消抖）
-    app_key_poll();
-    
-    // 处理按键事件
-    if (app_key_has_event()) {
-        // KEY1 按下事件
-        app_led_blink_success();
-        app_key_clear_event();
-    }
+    /* 按键改由官方 HAL 的 KEY 服务管理（HAL_KEY=TRUE 时 HAL_Init() 会调
+     * HAL_KeyInit() 配置 KEY2/PB4 为上拉输入）。用户存在的判定与 LED 提示
+     * 统一由 auth_sm 负责，这里不再自行轮询，避免与 UP 等待期间的 LED 状态打架。 */
     
     uint8_t notiData[SIMPLEPROFILE_CHAR4_LEN] = {0x88};
     peripheralChar4Notify(notiData, SIMPLEPROFILE_CHAR4_LEN);
@@ -769,8 +761,13 @@ void ble_usb_ServiceEvt(uint16_t connection_handle, ble_usb_evt_t *p_evt)
         case BLE_USB_EVT_BLE_DATA_RECIEVED:
             PRINT("BLE RX DATA len:%d\r\n", p_evt->data.length);
 
-            //ble to usb
-            USBSendData((uint8_t *)p_evt->data.p_data, p_evt->data.length);
+            /* 原为官方 ble-usb-cdc 示例的「BLE 数据透传到 USB」。
+             * 在 FIDO2 双模下这条路径是错的：BLE 侧的 CTAP 应当由本设备自己处理
+             * （CTAP 2.3 的 BLE 传输帧格式与 CTAPHID 不同，见计划 3.7），
+             * 转发给 USB 主机只会往 HID IN 端点注入主机无法理解的报文。
+             * 因此不再转发；待 3.7 实现 BLE CTAP 适配层后，把数据接到设备自身的
+             * 消息层（而不是 USB）即可。 */
+            (void)p_evt->data.p_data;
 
             break;
         default:

@@ -13,79 +13,10 @@
 #include "app_usb.h"
 #include "peripheral.h"
 #include "app_crypto.h"
+#include "ctaphid.h"
+#include "ctap.h"
 
-// CTAPHID/CTAP 命令常量（取值见 FIDO CTAPHID 规范）
-#ifndef CTAPHID_PING
-#define CTAPHID_PING                    0x01
-#endif
-#ifndef CTAPHID_MSG
-#define CTAPHID_MSG                     0x03
-#endif
-#ifndef CTAPHID_LOCK
-#define CTAPHID_LOCK                    0x04
-#endif
-#ifndef CTAPHID_INIT
-#define CTAPHID_INIT                    0x06
-#endif
-#ifndef CTAPHID_WINK
-#define CTAPHID_WINK                    0x08
-#endif
-#ifndef CTAPHID_CBOR
-#define CTAPHID_CBOR                    0x10
-#endif
-#ifndef CTAPHID_CANCEL
-#define CTAPHID_CANCEL                  0x11
-#endif
-#ifndef CTAPHID_KEEPALIVE
-#define CTAPHID_KEEPALIVE               0x3B
-#endif
-#ifndef CTAPHID_ERROR
-#define CTAPHID_ERROR                   0x3F
-#endif
-// CTAPHID 协议版本号（INIT 响应中返回）
-#ifndef CTAPHID_PROTOCOL_VERSION
-#define CTAPHID_PROTOCOL_VERSION        2
-#endif
-// CTAPHID 报文头：4 字节 Channel ID + 1 字节命令
-#ifndef CTAPHID_HEADER_LEN
-#define CTAPHID_HEADER_LEN              5
-#endif
-// CTAPHID_ERROR 错误码
-#ifndef CTAPHID_ERR_INVALID_CMD
-#define CTAPHID_ERR_INVALID_CMD         0x01
-#endif
-#ifndef CTAPHID_ERR_INVALID_LEN
-#define CTAPHID_ERR_INVALID_LEN         0x03
-#endif
-#ifndef CTAP_CBOR_GET_INFO
-#define CTAP_CBOR_GET_INFO              0x01
-#endif
-#ifndef CTAP_CBOR_MAKE_CREDENTIAL
-#define CTAP_CBOR_MAKE_CREDENTIAL       0x02
-#endif
-#ifndef CTAP_CBOR_GET_ASSERTION
-#define CTAP_CBOR_GET_ASSERTION         0x03
-#endif
-#ifndef CTAP_ERR_INVALID_MESSAGE
-#define CTAP_ERR_INVALID_MESSAGE        0x02
-#endif
-#ifndef CTAP_SUCCESS
-#define CTAP_SUCCESS                    0x00
-#endif
-#ifndef CTAP_ERR_INVALID_CBOR_TYPE
-#define CTAP_ERR_INVALID_CBOR_TYPE      0x32
-#endif
-#ifndef CTAP_ERR_NO_CREDENTIALS
-#define CTAP_ERR_NO_CREDENTIALS         0x33
-#endif
-#ifndef CTAP_MAX_MSG_SIZE
-#define CTAP_MAX_MSG_SIZE               1200
-#endif
-
-// 函数前置声明
-extern uint8_t handle_get_info(uint8_t *buf, uint8_t buf_len);
-extern uint8_t handle_make_credential(uint8_t *buf, uint8_t buf_len);
-extern uint8_t handle_get_assertion(uint8_t *buf, uint8_t buf_len);
+/* CTAPHID / CTAP 的命令码与错误码统一见 ctaphid.h / ctap.h */
 
 /*********************************************************************
  * CONSTANTS
@@ -113,23 +44,30 @@ const uint8_t MyCfgDescr[] = {
     0x07,0x05,0x01,0x03,DevEP1SIZE,0x00,0x01               //端点描述符
 };
 /*字符串描述符略*/
-/*HID类报表描述符*/
-const uint8_t HIDDescr[] = {  0x06, 0x00,0xff,
-                              0x09, 0x01,
-                              0xa1, 0x01,                                                   //集合开始
-                              0x09, 0x02,                                                   //Usage Page  用法
-                              0x15, 0x00,                                                   //Logical  Minimun
-                              0x26, 0x00,0xff,                                              //Logical  Maximun
-                              0x75, 0x08,                                                   //Report Size
-                              0x95, 0x40,                                                   //Report Counet
-                              0x81, 0x06,                                                   //Input
-                              0x09, 0x02,                                                   //Usage Page  用法
-                              0x15, 0x00,                                                   //Logical  Minimun
-                              0x26, 0x00,0xff,                                              //Logical  Maximun
-                              0x75, 0x08,                                                   //Report Size
-                              0x95, 0x40,                                                   //Report Counet
-                              0x91, 0x06,                                                   //Output
-                              0xC0};
+/* HID 报告描述符（FIDO CTAPHID，CTAP 2.3 §11.2.4）
+ *
+ * ⚠️ Usage Page 必须是 0xF1D0（FIDO Alliance）、Usage 为 0x01，
+ *    否则主机侧（Chrome / Windows / python-fido2）按 FIDO 用法页筛选时
+ *    根本发现不了这个设备 —— 这就是"python-fido2 报 0 个设备"的原因。
+ *    原先抄的是 WCH HID_CompliantDev 例程的厂商自定义用法页(0xFF00)。
+ *
+ * 本报文共 34 字节，与配置描述符里声明的 wDescriptorLength(0x0022) 一致。 */
+const uint8_t HIDDescr[] = {  0x06, 0xD0,0xF1,        // Usage Page (FIDO Alliance 0xF1D0)
+                              0x09, 0x01,            // Usage (Authenticator Device)
+                              0xa1, 0x01,            // Collection (Application)
+                              0x09, 0x20,            //   Usage (Input Report Data)
+                              0x15, 0x00,            //   Logical Minimum (0)
+                              0x26, 0x00,0xff,       //   Logical Maximum (255)
+                              0x75, 0x08,            //   Report Size (8)
+                              0x95, 0x40,            //   Report Count (64)
+                              0x81, 0x02,            //   Input (Data,Var,Abs)
+                              0x09, 0x21,            //   Usage (Output Report Data)
+                              0x15, 0x00,            //   Logical Minimum (0)
+                              0x26, 0x00,0xff,       //   Logical Maximum (255)
+                              0x75, 0x08,            //   Report Size (8)
+                              0x95, 0x40,            //   Report Count (64)
+                              0x91, 0x02,            //   Output (Data,Var,Abs)
+                              0xC0};                 // End Collection
 // 语言描述符
 const uint8_t MyLangDescr[] = {0x04, 0x03, 0x09, 0x04};
 // 厂家信息
@@ -145,18 +83,7 @@ const uint8_t MyProdInfo[] = {0x22, 0x03,
  * LOCAL VARIABLES
  */
 
-// CTAPHID协议缓冲区
-uint8_t hid_out_buffer[64];  // OUT端点接收数据
-uint8_t hid_out_len = 0;     // 接收数据长度
-volatile uint8_t hid_rx_ready = 0;  // RX完成标志
-
-uint8_t hid_in_buffer[64];   // IN端点发送数据
-uint8_t hid_in_len = 0;
-uint8_t hid_in_offset = 0;
-volatile uint8_t hid_in_sent = 1;  // 1 = 空闲（上一帧已上传完），0 = 正在向主机上传
-
-uint32_t hid_channel_id = 0xFFFFFFFF;
-uint8_t hid_init_done = 0;
+/* 收发缓冲与状态机统一由 ctaphid.c 管理，此处不再保留单帧缓冲 */
 
 // 端点RAM分配
 __attribute__((aligned(4))) uint8_t EP0_Databuf[64 + 64 + 64]; // ep0(64)+ep4_out(64)+ep4_in(64)
@@ -177,56 +104,8 @@ void app_usb_init()
 
     USB_DeviceInit();
     PFIC_EnableIRQ(USB_IRQn);
-}
 
-/**
- * @brief 通过HID IN端点发送数据给主机
- */
-void USBSendData(uint8_t *SendBuf, uint8_t l)
-{
-    if (l > 64) l = 64;
-    memcpy(hid_in_buffer, SendBuf, l);
-    hid_in_len = l;
-    hid_in_offset = 0;
-    hid_in_sent = 0;
-}
-
-/**
- * @brief 获取主机下发的HID数据
- */
-uint8_t app_usb_hid_get_data(uint8_t *buf, uint8_t *len)
-{
-    if (hid_rx_ready == 0) {
-        return -1;
-    }
-    *len = hid_out_len;
-    memcpy(buf, hid_out_buffer, hid_out_len);
-    return 0;
-}
-
-/**
- * @brief 发送HID响应给主机 (非阻塞)
- */
-int app_usb_hid_send(const uint8_t *data, uint8_t len)
-{
-    if (len > 64) len = 64;
-    if (hid_in_sent == 0) {
-        return -1;  // 正在上传中，忙
-    }
-    memcpy(hid_in_buffer, data, len);
-    hid_in_len = len;
-    hid_in_offset = 0;
-    hid_in_sent = 0;
-    return 0;
-}
-
-/**
- * @brief 重置接收标志
- */
-void app_usb_hid_reset_rx(void)
-{
-    hid_rx_ready = 0;
-    hid_out_len = 0;
+    ctaphid_init();
 }
 
 /**
@@ -234,136 +113,21 @@ void app_usb_hid_reset_rx(void)
  */
 void app_usb_hid_process(void)
 {
-    uint8_t response[64];
-    uint32_t channel_id;
-    uint8_t msg_type;
-    uint8_t payload_len;
-    uint8_t resp_len = 0;
+    /* CTAPHID 多帧收发与 CTAP 命令分发都在 ctaphid.c */
+    ctaphid_process();
 
-    if (hid_rx_ready == 0) {
-        return;
+    /* 新响应产生后：先装载第一帧到 EP1 IN 缓冲，再置端点为 ACK。
+     *
+     * 两个要点：
+     *  1) BUS_RST / CLEAR_FEATURE 把 EP1 置成 NAK 后没人恢复，响应会递不出去（主机一直等）；
+     *  2) 必须先装载再置 ACK —— 只置 ACK 不填缓冲的话，主机读到的是全 0
+     *     （ISR 里的取帧逻辑只在收到 IN 令牌后才跑，那时已经太晚了）。
+     * 后续帧由 EP1 IN 中断里的 ctaphid_next_report_out() 链式推进。 */
+    if (ctaphid_ready_to_load() && ctaphid_next_report_out(pEP1_IN_DataBuf))
+    {
+        R8_UEP1_T_LEN = CTAPHID_HID_REPORT;
+        R8_UEP1_CTRL  = (R8_UEP1_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_ACK;
     }
-    if (hid_out_len < CTAPHID_HEADER_LEN) {
-        hid_rx_ready = 0;
-        hid_out_len = 0;
-        return;
-    }
-
-    // 解析Channel ID (小端序)
-    channel_id = (uint32_t)hid_out_buffer[3] << 24 |
-                 (uint32_t)hid_out_buffer[2] << 16 |
-                 (uint32_t)hid_out_buffer[1] << 8 |
-                 (uint32_t)hid_out_buffer[0];
-
-    // 解析Message Type
-    msg_type = hid_out_buffer[4];
-    payload_len = hid_out_len - CTAPHID_HEADER_LEN;
-
-    hid_channel_id = channel_id;
-
-    memset(response, 0, sizeof(response));
-
-    // 所有 CTAPHID 响应都以 4 字节 Channel ID + (命令 | 0x80) 开头
-    response[0] = (uint8_t)(channel_id);
-    response[1] = (uint8_t)(channel_id >> 8);
-    response[2] = (uint8_t)(channel_id >> 16);
-    response[3] = (uint8_t)(channel_id >> 24);
-    response[4] = msg_type | 0x80;
-
-    switch (msg_type) {
-        case CTAPHID_PING:
-            // 回显 payload（单帧内最大 64 - 5 = 59 字节）
-            if (payload_len > sizeof(response) - CTAPHID_HEADER_LEN) {
-                payload_len = sizeof(response) - CTAPHID_HEADER_LEN;
-            }
-            memcpy(response + CTAPHID_HEADER_LEN,
-                   hid_out_buffer + CTAPHID_HEADER_LEN, payload_len);
-            resp_len = CTAPHID_HEADER_LEN + payload_len;
-            break;
-
-        case CTAPHID_INIT:
-            // nonce(8) 回显 + newCID(4) + 协议版本(1) + 设备版本(3) + caps(1)
-            if (payload_len < 8) {
-                response[4] = CTAPHID_ERROR;
-                response[5] = CTAPHID_ERR_INVALID_LEN;
-                resp_len = CTAPHID_HEADER_LEN + 1;
-                break;
-            }
-            memcpy(response + 5, hid_out_buffer + 5, 8);   // nonce 原样回显
-            // newCID 全 0：不分配新通道，主机继续沿用原 Channel ID
-            response[13] = 0x00;
-            response[14] = 0x00;
-            response[15] = 0x00;
-            response[16] = 0x00;
-            response[17] = CTAPHID_PROTOCOL_VERSION;       // CTAPHID 协议版本
-            response[18] = 0x00;                           // 设备版本 major
-            response[19] = 0x01;                           // 设备版本 minor
-            response[20] = 0x00;                           // 设备版本 build
-            response[21] = 0x05;                           // caps: WINK(0x01) | CBOR(0x04)
-            hid_init_done = 1;
-            resp_len = 22;
-            break;
-
-        case CTAPHID_WINK:
-            resp_len = CTAPHID_HEADER_LEN;                 // 空响应
-            break;
-
-        case CTAPHID_CANCEL:
-            resp_len = CTAPHID_HEADER_LEN;                 // CANCEL 无需响应体
-            break;
-
-        case CTAPHID_MSG:
-        case CTAPHID_CBOR:
-            if (msg_type == CTAPHID_CBOR && payload_len > 0) {
-                uint8_t ctap_cmd = hid_out_buffer[5];
-                uint8_t ctap_resp_code;
-
-                switch (ctap_cmd) {
-                    case CTAP_CBOR_GET_INFO:
-                        ctap_resp_code = handle_get_info(response + CTAPHID_HEADER_LEN,
-                                                         sizeof(response) - CTAPHID_HEADER_LEN);
-                        break;
-                    case CTAP_CBOR_MAKE_CREDENTIAL:
-                        ctap_resp_code = handle_make_credential(response + CTAPHID_HEADER_LEN,
-                                                                sizeof(response) - CTAPHID_HEADER_LEN);
-                        break;
-                    case CTAP_CBOR_GET_ASSERTION:
-                        ctap_resp_code = handle_get_assertion(response + CTAPHID_HEADER_LEN,
-                                                              sizeof(response) - CTAPHID_HEADER_LEN);
-                        break;
-                    default:
-                        ctap_resp_code = CTAP_ERR_INVALID_MESSAGE;
-                        break;
-                }
-
-                if (ctap_resp_code == CTAP_SUCCESS) {
-                    // CTAP 响应数据过大时本实现暂不支持 CTAPHID 续帧
-                    resp_len = CTAPHID_HEADER_LEN;
-                } else {
-                    response[4] = CTAPHID_ERROR;
-                    response[5] = ctap_resp_code;
-                    resp_len = CTAPHID_HEADER_LEN + 1;
-                }
-            } else {
-                response[4] = CTAPHID_ERROR;
-                response[5] = CTAPHID_ERR_INVALID_CMD;
-                resp_len = CTAPHID_HEADER_LEN + 1;
-            }
-            break;
-
-        default:
-            response[4] = CTAPHID_ERROR;
-            response[5] = CTAPHID_ERR_INVALID_CMD;
-            resp_len = CTAPHID_HEADER_LEN + 1;
-            break;
-    }
-
-    if (resp_len > 0) {
-        app_usb_hid_send(response, resp_len);
-    }
-
-    hid_rx_ready = 0;
-    hid_out_len = 0;
 }
 
 /*********************************************************************
@@ -422,34 +186,26 @@ void USB_DevTransProcess(void)
                 {
                     if (R8_USB_INT_ST & RB_UIS_TOG_OK)
                     {
-                        /* EP1 已使能 RB_UEP_AUTO_TOG，R_TOG 由硬件翻转，软件不得再手动翻转 */
+                        /* R_TOG 由 EP1 的 RB_UEP_AUTO_TOG 硬件翻转 */
                         len = R8_USB_RX_LEN;
-                        if (len > sizeof(hid_out_buffer))
-                            len = sizeof(hid_out_buffer);
-                        memcpy(hid_out_buffer, pEP1_OUT_DataBuf, len);
-                        hid_out_len = len;
-                        hid_rx_ready = 1;
+                        if (len > CTAPHID_HID_REPORT)
+                            len = CTAPHID_HID_REPORT;
+                        ctaphid_report_in(pEP1_OUT_DataBuf, len);
                     }
                     break;
                 }
 
                 case UIS_TOKEN_IN | 1:
                 {
-                    /* EP1 已使能 RB_UEP_AUTO_TOG，T_TOG 由硬件翻转，软件不得再手动翻转 */
-                    if (hid_in_sent == 0 && hid_in_len > 0) {
-                        len = hid_in_len > 64 ? 64 : hid_in_len;
-                        memcpy(pEP1_IN_DataBuf, hid_in_buffer + hid_in_offset, len);
-                        hid_in_offset += len;
-                        hid_in_len -= len;
-                        if (hid_in_len == 0) {
-                            hid_in_sent = 1;
-                            hid_in_offset = 0;
-                        }
-                        R8_UEP1_T_LEN = len;
+                    /* T_TOG 由 EP1 的 RB_UEP_AUTO_TOG 硬件翻转；
+                     * 有下一帧就 ACK 上传，否则回 NAK */
+                    if (ctaphid_next_report_out(pEP1_IN_DataBuf))
+                    {
+                        R8_UEP1_T_LEN = CTAPHID_HID_REPORT;
                         R8_UEP1_CTRL = (R8_UEP1_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_ACK;
-                    } else {
-                        /* 没有待发数据：回 NAK，避免向主机发送 0 长度 HID 报告 */
-                        hid_in_sent = 1;
+                    }
+                    else
+                    {
                         R8_UEP1_T_LEN = 0;
                         R8_UEP1_CTRL = (R8_UEP1_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_NAK;
                     }
@@ -687,13 +443,7 @@ void USB_DevTransProcess(void)
         R8_UEP1_CTRL = UEP_R_RES_ACK | UEP_T_RES_NAK | RB_UEP_AUTO_TOG;
         R8_UEP2_CTRL = UEP_R_RES_ACK | UEP_T_RES_NAK | RB_UEP_AUTO_TOG;
         R8_UEP3_CTRL = UEP_R_RES_ACK | UEP_T_RES_NAK | RB_UEP_AUTO_TOG;
-        hid_rx_ready = 0;
-        hid_in_sent = 1;
-        hid_init_done = 0;
-        hid_channel_id = 0xFFFFFFFF;
-        hid_out_len = 0;
-        hid_in_len = 0;
-        hid_in_offset = 0;
+        ctaphid_reset();
         Ready = 0;
         DevConfig = 0;
         R8_USB_INT_FG = RB_UIF_BUS_RST;
@@ -726,93 +476,5 @@ void USB_IRQHandler(void)
     USB_DevTransProcess();
 }
 
-/**
- * @brief GetInfo CTAP命令处理
- */
-uint8_t handle_get_info(uint8_t *buf, uint8_t buf_len)
-{
-    if (buf_len < 100) return CTAP_ERR_INVALID_CBOR_TYPE;
-    
-    // 构建GetInfo响应 CBOR编码
-    buf[0] = 0x04; // array (4 items)
-    buf[1] = 0x68; // text string 8 bytes
-    buf[2] = 'F';  // "FIDO_2.0"
-    buf[3] = 'I';
-    buf[4] = 'D';
-    buf[5] = 'O';
-    buf[6] = '_';
-    buf[7] = '2';
-    buf[8] = '.';
-    buf[9] = '0';
-    buf[10] = 0x68;
-    buf[11] = 'F';
-    buf[12] = 'I';
-    buf[13] = 'D';
-    buf[14] = 'O';
-    buf[15] = '_';
-    buf[16] = '2';
-    buf[17] = '.';
-    buf[18] = '1';
-    buf[19] = 0x80; // empty array (extensions)
-    buf[20] = 0x50; // bytes 16 (aaguid)
-    memcpy(buf + 21, g_aaguid, 16);
-    buf += 37;
-    
-    // options map
-    buf[0] = 0xA2; // map with 2 entries
-    buf[1] = 0x62; // "up"
-    buf[2] = 'u';
-    buf[3] = 'p';
-    buf[4] = 0xF5; // true
-    buf[5] = 0x62; // "rk"
-    buf[6] = 'r';
-    buf[7] = 'k';
-    buf[8] = 0xF5; // true
-    buf += 9;
-    
-    // maxMsgSize
-    buf[0] = 0x69; // "maxMsgSize"
-    buf[1] = 'm';
-    buf[2] = 'a';
-    buf[3] = 'x';
-    buf[4] = 'M';
-    buf[5] = 's';
-    buf[6] = 'g';
-    buf[7] = 'S';
-    buf[8] = 'i';
-    buf[9] = 'z';
-    buf[10] = 'e';
-    buf[11] = ' ';
-    buf[12] = 0x1A; // uint32
-    uint32_t max_size = CTAP_MAX_MSG_SIZE;
-    buf[13] = (max_size >> 24) & 0xFF;
-    buf[14] = (max_size >> 16) & 0xFF;
-    buf[15] = (max_size >> 8) & 0xFF;
-    buf[16] = max_size & 0xFF;
-    buf += 17;
-    
-    // transports
-    buf[0] = 0x81; // array with 1 item
-    buf[1] = 0x63; // "usb"
-    buf[2] = 'u';
-    buf[3] = 'S';
-    buf[4] = 'B';
-    
-    return CTAP_SUCCESS;
-}
-
-/**
- * @brief MakeCredential CTAP命令处理
- */
-uint8_t handle_make_credential(uint8_t *buf, uint8_t buf_len)
-{
-    return CTAP_ERR_INVALID_OPTION;
-}
-
-/**
- * @brief GetAssertion CTAP命令处理
- */
-uint8_t handle_get_assertion(uint8_t *buf, uint8_t buf_len)
-{
-    return CTAP_ERR_NO_CREDENTIALS;
-}
+/* handle_get_info / handle_make_credential / handle_get_assertion
+ * 已迁移到 ctap.c（CTAP2 命令层，CBOR 编码符合 CTAP 2.3） */

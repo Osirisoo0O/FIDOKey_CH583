@@ -44,10 +44,12 @@ extern "C" {
  * TYPEDEFS
  */
 
-/* ����һ��LED���ڼ����ʾ����Ľ���,�͵�ƽLED�� */
+/* 连接一个LED用于监控演示程序的进度,低电平LED亮 */
 
 /* 1 - LED */
-#define LED1_BV                 BV(15)
+/* 注意：WCH 模板默认此处为 BV(15)，但本板 LED 实测接在 PB18。
+ * 已由 tools 里的引脚扫描确认（PB18 输出低电平时 LED 亮）。 */
+#define LED1_BV                 BV(18)
 #define LED2_BV
 #define LED3_BV
 
