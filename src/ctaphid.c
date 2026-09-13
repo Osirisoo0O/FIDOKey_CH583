@@ -13,6 +13,7 @@
 #include "ctaphid.h"
 #include "debug_log.h"
 #include "ctap.h"
+#include "auth_sm.h"
 
 /* 待发响应缓冲（GetInfo 41B、含签名的断言响应约 300B，512 足够且有 RAM 余量） */
 #define CTAPHID_MAX_TX_MSG              512
@@ -45,6 +46,11 @@ static uint8_t  tx_active;
 static uint32_t s_pend_cid;
 
 static uint8_t  s_ctap_pending;
+
+/* USB 复位会把挂起状态丢掉，但 auth_sm 可能仍在等待用户按键。
+ * 中断上下文里不能直接清（auth_sm_clear() 走 LED 库、涉及 TMOS），
+ * 所以置位这个标志，交由主循环的 ctaphid_pending_poll() 消费。 */
+static uint8_t  s_need_abort_up;
 
 /* 等待用户确认期间，CTAP 规范要求定期上报 CTAPHID_KEEPALIVE，
  * 否则主机会在自身超时（Chrome 约 10s）后放弃整个操作 ——
@@ -115,7 +121,15 @@ void ctaphid_init(void)
  */
 void ctaphid_reset(void)
 {
+    uint8_t was_pending = s_ctap_pending;
+
     ctaphid_clear();
+
+    if(was_pending)
+    {
+        /* 挂起被复位丢弃 → 让主循环把 auth_sm 的等待也收掉 */
+        s_need_abort_up = 1;
+    }
 }
 
 /*********************************************************************
@@ -488,6 +502,59 @@ int ctaphid_has_pending_out(void)
 int ctaphid_ready_to_load(void)
 {
     return (tx_active && tx_offset == 0) ? 1 : 0;
+}
+
+/*********************************************************************
+ * @fn      ctaphid_pending_poll
+ *
+ * @brief   推进被挂起的 CTAP 操作（由主循环调用）
+ *
+ * 命令在副作用之前过 UP 闸门，未取得时返回 CTAP_STATUS_PENDING；
+ * 本层保留报文、不发响应，并置挂起标志。用户按键（AUTH_WAIT_GRANTED）
+ * 后用保留的报文重跑该命令；超时（AUTH_WAIT_TIMEOUT）按规范回填
+ * CTAP_ERR_ACTION_TIMEOUT。
+ *
+ * 为什么安全：第一次进入只过了闸门就返回，没有持久化副作用
+ *       （未写 Flash），所以重放不会造成重复副作用。
+ *
+ * 为什么放在传输层而不是 ctap.c：挂起状态（报文缓冲、通道号）是本层
+ *       的资源，推进逻辑必须访问它们；若放在 ctap.c，协议核心就得反向
+ *       调用具体传输层，加入 BLE 后将无法并行。BLE 侧有对称实现。
+ */
+void ctaphid_pending_poll(void)
+{
+    /* 复位遗留：挂起没了，但可能还在等 UP */
+    if(s_need_abort_up)
+    {
+        s_need_abort_up = 0;
+        SK_LOG("ctap: dangling UP wait cleared (reset)");
+        ctap_abort_pending();
+    }
+
+    if(!s_ctap_pending)
+    {
+        return;
+    }
+
+    switch(auth_sm_get())
+    {
+        case AUTH_WAIT_GRANTED:
+            /* 用户已确认：重跑挂起的命令（重跑时 ctap_up_gate() 会放行）。
+             * clear 必须在重跑之后 —— 先清会导致重跑时再次要求按键。 */
+            SK_LOG("ctap: UP granted, reprocess");
+            (void)ctaphid_reprocess();
+            auth_sm_clear();
+            break;
+
+        case AUTH_WAIT_TIMEOUT:
+            SK_LOG("ctap: UP timeout -> 0x3A");
+            auth_sm_clear();
+            (void)ctaphid_ctap_reply(CTAP_ERR_ACTION_TIMEOUT, NULL, 0);
+            break;
+
+        default:
+            break;                          /* 仍在等待用户 */
+    }
 }
 
 int ctaphid_ctap_is_pending(void)

@@ -16,6 +16,7 @@
 #include "peripheral.h"
 #include "app_usb.h"
 #include "ctaphid.h"
+#include "ble_transport.h"
 #include "LED.h"
 #include "app_crypto.h"
 #include "app_ecdsa.h"
@@ -52,7 +53,12 @@ void Main_Circulation()
         app_usb_hid_process();
         // 用户存在等待：推进按键/超时判断，并完成被挂起的 CTAP 操作
         auth_sm_poll();
-        ctap_pending_poll();
+        // 推进被挂起的 CTAP 操作（取得 UP 后重放 / 超时回填 0x3A）
+        ctaphid_pending_poll();
+        // BLE 侧：把待发内容按 MTU 逐帧送出（FIDO BLE 的发送调度）
+        ble_transport_pump();
+        // BLE 侧：推进被挂起的 CTAP 操作（取得 UP 后重放 / 超时回填 0x3A）
+        ble_transport_pending_poll();
     }
 }
 

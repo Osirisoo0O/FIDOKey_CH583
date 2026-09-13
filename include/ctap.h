@@ -71,12 +71,6 @@ uint8_t ctap_handle_cbor(uint8_t cmd,
                          uint16_t *resp_len);
 
 /**
- * @brief 推进被挂起的 CTAP 操作（等用户按键的那种）
- * @note  由主循环反复调用；取得 UP 或超时后会自动把响应回填给 ctaphid 层。
- */
-void ctap_pending_poll(void);
-
-/**
  * @brief 中止挂起的操作（CTAPHID_CANCEL 用）
  * @note  清掉 UP 等待状态让设备回到空闲。按规范不产生任何响应。
  */

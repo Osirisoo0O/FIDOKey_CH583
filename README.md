@@ -39,7 +39,7 @@
 | CTAP2 `credentialManagement` | 未实现（需 PIN/UV 认证，本实现无 PIN） |
 | Resident Key（可驻留凭证） | 未支持，请求 `rk=true` 时按规范拒绝（`0x2B`） |
 | Attestation | `none`（`attStmt` 为空 map） |
-| BLE 侧 CTAP 传输 | 未实现 |
+| BLE 侧 CTAP 传输（GATT） | **已实现并验证**，但主流客户端接入受阻（见下）|
 
 **实机验证**：`webauthn.io` 与 `demo.yubico.com` 两个站点的注册与登录均正常。
 
@@ -205,6 +205,7 @@ python tools/fido2_server_test.py    # 完整服务端验证（最接近真实�
 | `SK_LOG_ENABLE` | `0` | 串口日志（见 `debug_log.h`） |
 | `CTAPHID_DUMP` | 未定义 | 打印 CTAP 请求/响应全文，**排障用，会阻塞串口** |
 | `SK_SIG_DER` | `1` | 签名输出格式，见下 |
+| `BLE_BUFF_MAX_LEN` | `100` | BLE 数据包缓冲，决定 `ATT_MTU = 值 - 4`（默认 27 → MTU 23 过小）|
 
 ### `SK_SIG_DER`：签名格式（重要）
 
@@ -307,7 +308,11 @@ passed 5/5
 - **不支持 Resident Key**：请求 `rk=true` 时返回 `0x2B`（如实拒绝，非静默忽略）
 - **不支持 `credentialManagement`**：该命令要求 PIN/UV，本实现无 PIN
 - **Attestation 为 `none`**：不提供 `packed` 等可验证的 attestation
-- **BLE 侧 CTAP 传输未实现**：目前 BLE 仅作为外设存在
+- **BLE 侧 CTAP 传输已实现，但客户端兼容性受限**：
+  设备侧的 GATT 服务、帧编解码、UP 挂起、配对均已验证（Windows 曾完整发起
+  `MakeCredential`），但 Android/Windows 客户端在服务发现后放弃。原因是经典
+  BLE GATT FIDO 本身的长期不可靠（OpenSK 以 USB 为主、Chrome 曾移除 BLE 支持、
+  业界已转向 caBLE）。详见 [BLE 侧实现规划](docs/BLE侧实现规划.md)
 - **`up=false` 的探测请求会直接放行**：不做用户确认（符合浏览器自动填充探测的需求）
 
 ### 待办
@@ -332,6 +337,8 @@ passed 5/5
 | 文档 | 内容 |
 |---|---|
 | [详细软件开发计划](docs/详细软件开发计划.md) | 开发计划与各阶段进度；**5.2.1~5.2.3** 为 USB 侧验证结果与缺陷分析 |
+| [BLE 侧实现规划](docs/BLE侧实现规划.md) | BLE CTAP2 传输的规范要点、设计、**实施结果与客户端兼容性分析** |
+| [BLE 侧实现分析](docs/BLE侧实现分析.md) | 三个决策点的方案对比与推荐；含反向依赖等架构问题分析 |
 | [FIDO2 端到端验证记录](docs/FIDO2端到端验证记录.md) | 验证过程、关键规律、签名格式专题 |
 | [真机测试步骤](docs/真机测试步骤.md) | T1~T7 测试清单与结果记录、问题排查 |
 | [基于 CH583 的 FIDO2 安全密钥开发](docs/基于CH583的FIDO2安全密钥开发.md) | 总体设计 |

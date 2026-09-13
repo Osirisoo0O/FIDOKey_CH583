@@ -63,7 +63,6 @@ void auth_sm_poll(void)
         return;
     }
     s_last_sample = now;
-
     if(HAL_PUSH_BUTTON2())          /* PB4；KEY2_IN 已由 ACTIVE_LOW 归一为「按下=1」 */
     {
         s_press_cnt++;

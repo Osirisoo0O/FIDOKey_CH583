@@ -17,6 +17,8 @@
 #include "gattprofile.h"
 #include "peripheral.h"
 #include "ble_usb_service.h"
+#include "fido_service.h"
+#include "ble_transport.h"
 #include "app_usb.h"
 
 /*********************************************************************
@@ -50,13 +52,21 @@
 #define DEFAULT_DESIRED_MIN_CONN_INTERVAL    6
 
 // Maximum connection interval (units of 1.25ms, 100=125ms)
-#define DEFAULT_DESIRED_MAX_CONN_INTERVAL    100
+#define DEFAULT_DESIRED_MAX_CONN_INTERVAL    200
 
 // Slave latency to use parameter update
 #define DEFAULT_DESIRED_SLAVE_LATENCY        0
 
 // Supervision timeout value (units of 10ms, 100=1s)
-#define DEFAULT_DESIRED_CONN_TIMEOUT         100
+/* 连接监督超时（单位 10ms）。
+ *
+ * 原值 100 = 1 秒，对 FIDO 场景太短：MakeCredential 要做 P-256 密钥生成 +
+ * 签名 + Flash 写入，micro-ecc 在 60MHz 上可能耗时超过 1 秒，期间设备无法
+ * 响应链路层心跳，连接会被判定超时断开（实测表现为 notify 返回
+ * bleNotConnected、CCCD 被清零）。
+ *
+ * 规范上限是 32 秒（3200）。这里取 6 秒，给耗时操作留足余量。 */
+#define DEFAULT_DESIRED_CONN_TIMEOUT         600
 
 // Company Identifier: WCH
 #define WCH_COMPANY_ID                       0x07D7
@@ -128,13 +138,33 @@ static uint8_t advertData[] = {
     GAP_ADTYPE_FLAGS,
     DEFAULT_DISCOVERABLE_MODE | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED,
 
-    // service UUID, to notify central devices what services are included
-    // in this peripheral
+    // FIDO 服务（128-bit UUID）：客户端靠广播里的服务 UUID 筛选目标设备，
+    // 因此必须放在广播包（而不能只放在扫描响应）里。
+    // 0000fffd-0000-1000-8000-00805f9b34fb，16 字节整体反序存放
+    // （WCH 栈不采用 BLE 规范的分段反序；详见 fido_service.c 的说明）
+    0x11,                      // length: 1(type) + 16(uuid)
+    GAP_ADTYPE_128BIT_COMPLETE,
+    0xfd, 
+    0xff,
+    0x00, 0x00, 
+    0x00, 0x00,     
+    0x00, 0x10, 
+    0x80, 
+    0x00,
+   
+    0x00, 0x80,
+    0x5f, 0x9b,
+    0x34, 0xfb, 
+
+    // WCH 示例服务，暂时保留：在 FIDO 服务尚未跑通前，它是"蓝牙连接本身
+    // 是否正常"的参照物（见 docs/BLE侧实现分析.md §3）
     0x03,                  // length of this data
     GAP_ADTYPE_16BIT_MORE, // some of the UUID's, but not all
     LO_UINT16(SIMPLEPROFILE_SERV_UUID),
     HI_UINT16(SIMPLEPROFILE_SERV_UUID)
 };
+
+/* 说明：上面两段合计 3 + 18 + 4 = 25 字节，未超过 B_MAX_ADV_LEN(31)。 */
 
 // GAP GATT Attributes
 static uint8_t attDeviceName[GAP_DEVICE_NAME_LEN] = "Simple Peripheral";
@@ -174,10 +204,15 @@ static gapRolesBroadcasterCBs_t Broadcaster_BroadcasterCBs = {
     NULL  // Receive scan request callback
 };
 
+/** 配对状态回调：把配对过程打出来，便于定位"配对卡在哪一步" */
+static void Peripheral_PairStateCB(uint16_t connHandle, uint8_t state, uint8_t status)
+{
+}
+
 // GAP Bond Manager Callbacks
 static gapBondCBs_t Peripheral_BondMgrCBs = {
-    NULL, // Passcode callback (not used by application)
-    NULL  // Pairing / Bonding state Callback (not used by application)
+    NULL,                          // Passcode callback（Just Works 不需要）
+    Peripheral_PairStateCB         // Pairing / Bonding state Callback
 };
 
 // Simple GATT Profile Callbacks
@@ -234,7 +269,15 @@ void Peripheral_Init()
         GAP_SetParamValue(TGAP_ADV_SCAN_REQ_NOTIFY, ENABLE);
     }
 
+
     // Setup the GAP Bond Manager
+    //
+    // 注意：本配置（mitm=TRUE + DISPLAY_ONLY）要求设备"显示配对密码"，
+    // 而 Peripheral_BondMgrCBs 的 passcodeCB 目前是 NULL，设备实际无法显示。
+    // 曾试过改成 Just Works（mitm=FALSE + NO_INPUT_NO_OUTPUT），但那会让
+    // 使用方难以判断状态，故恢复为本来的配置。
+    //
+    // 若后续遇到配对卡住，这里是最先要检查的地方。
     {
         uint32_t passkey = 0; // passkey "000000"
         uint8_t  pairMode = GAPBOND_PAIRING_MODE_WAIT_FOR_REQ;
@@ -254,6 +297,9 @@ void Peripheral_Init()
     DevInfo_AddService();                        // Device Information Service
     SimpleProfile_AddService(GATT_ALL_SERVICES); // Simple GATT Profile
     ble_usb_add_service(ble_usb_ServiceEvt);
+    /* FIDO GATT 服务由传输层负责注册（它要把自己的事件回调接上），
+     * 这里不再单独调用 fido_add_service，避免重复注册同一服务。 */
+    ble_transport_init();
 
     // Setup the SimpleProfile Characteristic Values
     {
@@ -442,6 +488,8 @@ static void Peripheral_ProcessTMOSMsg(tmos_event_hdr_t *pMsg)
             if(pMsgEvent->method == ATT_MTU_UPDATED_EVENT)
             {
                 peripheralMTU = pMsgEvent->msg.exchangeMTUReq.clientRxMTU;
+                /* BLE 传输层按 MTU 决定分片粒度 */
+                ble_transport_set_mtu(peripheralMTU);
                 PRINT("mtu exchange: %d\n", pMsgEvent->msg.exchangeMTUReq.clientRxMTU);
             }
             break;
@@ -474,6 +522,8 @@ static void Peripheral_LinkEstablished(gapRoleEvent_t *pEvent)
     else
     {
         peripheralConnList.connHandle = event->connectionHandle;
+        /* 通知要发到这个连接上，传输层必须知道句柄 */
+        ble_transport_set_conn(event->connectionHandle);
         peripheralConnList.connInterval = event->connInterval;
         peripheralConnList.connSlaveLatency = event->connLatency;
         peripheralConnList.connTimeout = event->connTimeout;
@@ -503,13 +553,14 @@ static void Peripheral_LinkEstablished(gapRoleEvent_t *pEvent)
 static void Peripheral_LinkTerminated(gapRoleEvent_t *pEvent)
 {
     gapTerminateLinkEvent_t *event = (gapTerminateLinkEvent_t *)pEvent;
-
     if(event->connectionHandle == peripheralConnList.connHandle)
     {
         peripheralConnList.connHandle = GAP_CONNHANDLE_INIT;
         peripheralConnList.connInterval = 0;
         peripheralConnList.connSlaveLatency = 0;
         peripheralConnList.connTimeout = 0;
+        /* 丢弃半截的收发状态，避免下次连接时串味 */
+        ble_transport_clear();
         tmos_stop_task(Peripheral_TaskID, SBP_PERIODIC_EVT);
         tmos_stop_task(Peripheral_TaskID, SBP_READ_RSSI_EVT);
 

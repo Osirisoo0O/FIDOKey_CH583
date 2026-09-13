@@ -39,6 +39,8 @@
 #define ATTOBJ_MAX                  320
 
 /* authData flags */
+extern uint32_t TMOS_GetSystemClock(void);
+
 #define FLAG_UP                     0x01
 #define FLAG_UV                     0x04
 #define FLAG_AT                     0x40
@@ -262,7 +264,6 @@ static int ctap_check_algs(cbor_reader_t *r, uint8_t *es256_ok)
 
             rc = cbor_read_text(r, &key, &klen);
             if(rc != CBOR_OK) { return rc; }
-
             if(klen == 3 && memcmp(key, "alg", 3) == 0)
             {
                 int32_t alg;
@@ -726,36 +727,18 @@ static uint8_t ctap_make_credential(const uint8_t *param, uint16_t param_len,
             memset(s_priv, 0, sizeof(s_priv));
             return CTAP_ERR_OTHER;
         }
-        /* 8) 对 authData ‖ clientDataHash 求 SHA-256，再用私钥签名 */
-        {
-            uint8_t  digest[COSE_HASH_LEN];
-            uint8_t  sr[32];
-            uint8_t  ss[32];
-
-            memcpy(s_signbuf, s_authdata, alen);
-            memcpy(s_signbuf + alen, s_cdh, COSE_HASH_LEN);
-
-            if(sha256(s_signbuf, (uint32_t)alen + COSE_HASH_LEN, digest) != 0)
-            {
-                memset(s_priv, 0, sizeof(s_priv));
-                return CTAP_ERR_OTHER;
-            }
-
-            /* attestation = "none" 时不做签名，但先验证签名链路可用：
-             * 这一步同时作为 MakeCredential 的自检（失败即报错，
-             * 避免把不可用的凭证写进 Flash 后才发现）。 */
-            if(ecdsa_sign(s_priv, digest, sr, ss) != 0)
-            {
-                memset(s_priv, 0, sizeof(s_priv));
-                return CTAP_ERR_OTHER;
-            }
-            if(ecdsa_verify(s_pub, digest, sr, ss) != 0)
-            {
-                memset(s_priv, 0, sizeof(s_priv));
-                return CTAP_ERR_OTHER;
-            }
-        }
-
+        /* 8) attestation = "none"：attStmt 为空 map，响应里**不含签名**，
+         *    所以 MakeCredential 不需要任何签名运算。
+         *
+         *    这里原本会跑一次 sign + verify 作为"签名链路自检"，实测耗时：
+         *        make_key 1719ms + sign 1807ms + verify 2022ms ≈ 5.5s
+         *    而 BLE 连接的监督超时只有 720ms（客户端设定，设备改不了），
+         *    主循环被阻塞这么久会让连接被判超时断开 —— 故整段自检移除。
+         *
+         *    签名能力的验证途径仍然存在：
+         *      - ecdsa_selftest() 在上电自检里跑完整的 sign/verify 闭环
+         *      - GetAssertion 每次登录都会实际签名，服务端会验证
+         */
         /* 9) 组装 attestationObject = { 1: "none", 2: h'authData', 3: {} } */
         o = cbor_put_map_head(s_attobj, ATTOBJ_MAX, 0, 3);
         if(o == CBOR_ENC_ERR) { memset(s_priv, 0, sizeof(s_priv)); return CTAP_ERR_OTHER; }
@@ -769,7 +752,6 @@ static uint8_t ctap_make_credential(const uint8_t *param, uint16_t param_len,
     }
 
     memset(s_priv, 0, sizeof(s_priv));
-
     /* 10) 直接把 attestationObject 作为响应体返回 */
     {
         uint32_t attobj_len = o;
@@ -1064,57 +1046,6 @@ static uint8_t ctap_get_assertion(const uint8_t *param, uint16_t param_len,
 }
 
 /*********************************************************************
- * @fn      ctap_pending_poll
- *
- * @brief   推进被挂起的 CTAP 操作（由主循环调用）
- *
- * 流程：命令处理在副作用之前调用 ctap_up_gate()，未取得 UP 时返回
- *       CTAP_STATUS_PENDING；ctaphid 层保留报文、不发响应，并置挂起标志。
- *       用户按键（AUTH_WAIT_GRANTED）后本函数让 ctaphid 用保留的报文重跑该命令；
- *       超时（AUTH_WAIT_TIMEOUT）则按规范回填 CTAP_ERR_ACTION_TIMEOUT。
- *
- * 为什么这样是安全的：第一次进入时命令只过了 UP 闸门就返回，
- *       没有产生任何持久化副作用（也没写 Flash），所以重放不会造成重复副作用。
- */
-void ctap_pending_poll(void)
-{
-    if(!ctaphid_ctap_is_pending())
-    {
-        /* 没有挂起的 CTAP 请求，但 UP 等待可能还开着——典型场景是 USB 总线复位：
-         * ctaphid_reset() 清了挂起标志，auth_sm 却仍在等待。若不在这里收掉，
-         * LED 会一直慢闪、状态机永远停在 ACTIVE，下一次请求也会被误判。
-         * 放在这里（主循环上下文）而不是 ctaphid_reset()（中断上下文）里清，
-         * 是因为 auth_sm_clear() 会走 LED 库、涉及 TMOS，不宜在中断里调用。 */
-        if(auth_sm_get() == AUTH_WAIT_ACTIVE)
-        {
-            SK_LOG("ctap: dangling UP wait cleared");
-            auth_sm_clear();
-        }
-        return;
-    }
-
-    switch(auth_sm_get())
-    {
-        case AUTH_WAIT_GRANTED:
-            /* 用户已确认：重跑挂起的命令。重跑过程中 ctap_up_gate() 会放行。
-             * 注意 clear 必须在重跑之后——先清会导致重跑时再次要求按键。 */
-            SK_LOG("ctap: UP granted, reprocess");
-            (void)ctaphid_reprocess();
-            auth_sm_clear();
-            break;
-
-        case AUTH_WAIT_TIMEOUT:
-            SK_LOG("ctap: UP timeout -> 0x3A");
-            auth_sm_clear();
-            (void)ctaphid_ctap_reply(CTAP_ERR_ACTION_TIMEOUT, NULL, 0);
-            break;
-
-        default:
-            break;                          /* 仍在等待用户 */
-    }
-}
-
-/*********************************************************************
  * @fn      ctap_abort_pending
  *
  * @brief   中止挂起的操作（CTAPHID_CANCEL 触发）
@@ -1122,6 +1053,10 @@ void ctap_pending_poll(void)
  * @note    只清"等待用户存在"的状态。因为采用可重入重放方案，
  *          挂起期间并没有保存任何操作上下文（每次重放都从头解析），
  *          也就不需要在别处清理什么。按规范 CANCEL 不产生响应。
+ *
+ *          调用方是"传输层"（CTAPHID 的 CANCEL 分支、BLE 的对应分支）。
+ *          本模块不主动推进挂起操作 —— 那属于传输层的职责，
+ *          否则协议核心会反向依赖具体的传输实现。
  */
 void ctap_abort_pending(void)
 {

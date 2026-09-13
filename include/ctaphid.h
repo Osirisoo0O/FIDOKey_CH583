@@ -113,6 +113,15 @@ int ctaphid_has_pending_out(void);
 int ctaphid_ready_to_load(void);
 
 /**
+ * @brief 推进被挂起的 CTAP 操作（由主循环调用）
+ *
+ * 命令因未取得 UP 而挂起后，本函数在用户按键时用保留的报文重放该命令；
+ * 超时则回填 CTAP_ERR_ACTION_TIMEOUT。挂起状态与报文都是本层的资源，
+ * 所以推进逻辑也放在本层 —— ctap.c 不反向依赖具体传输层。
+ */
+void ctaphid_pending_poll(void);
+
+/**
  * @brief CTAP 命令是否处于挂起状态（等待异步完成，例如等用户按键）
  */
 int ctaphid_ctap_is_pending(void);
