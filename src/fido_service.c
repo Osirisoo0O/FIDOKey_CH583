@@ -44,8 +44,8 @@
  */
 #define ATTR_IDX_CONTROL_POINT_VALUE    2
 #define ATTR_IDX_STATUS_VALUE           4
-#define ATTR_IDX_CP_LENGTH_VALUE        7
-#define ATTR_IDX_REV_BITFIELD_VALUE     9
+#define ATTR_IDX_CP_LENGTH_VALUE        9
+#define ATTR_IDX_REV_BITFIELD_VALUE     7
 
 /*********************************************************************
  * GLOBAL VARIABLES
@@ -172,6 +172,25 @@ static gattAttribute_t s_ProfileAttrTbl[] = {
         (uint8_t *)s_StatusCCCD
     },
 
+    /* ---- 特征 4: fidoServiceRevisionBitfield (Read/Write) ----
+     *
+     * 放在 fidoControlPointLength **之前**：实测客户端按 handle 升序遍历，
+     * 读到第一个"它认识的"特征后就停下（日志里它只读 CPLength 就放弃，
+     * 且从不读 Bitfield，而规范要求"先检查 Bitfield 并写入版本位"）。
+     * 交换两者顺序后 Bitfield 的 handle 更小，客户端应能先遇到它。
+     * UUID 与属性均未改变，nRF Connect 手工验证不受影响。 */
+    {
+        {ATT_BT_UUID_SIZE, characterUUID},
+        GATT_PERMIT_READ,
+        0,
+        &s_RevBitfieldProps
+    },
+    {
+        {ATT_UUID_SIZE, fido_ServiceRevisionBitfieldUUID}, /* idx 7 */
+        GATT_PERMIT_READ | GATT_PERMIT_WRITE,
+        0,
+        &s_RevBitfieldValue
+    },
     /* ---- 特征 3: fidoControlPointLength (Read) ---- */
     {
         {ATT_BT_UUID_SIZE, characterUUID},
@@ -180,24 +199,10 @@ static gattAttribute_t s_ProfileAttrTbl[] = {
         &s_CPLengthProps
     },
     {
-        {ATT_UUID_SIZE, fido_ControlPointLengthUUID},/* idx 8 */
+        {ATT_UUID_SIZE, fido_ControlPointLengthUUID},/* idx 9 */
         GATT_PERMIT_READ,
         0,
         s_CPLengthValue
-    },
-
-    /* ---- 特征 4: fidoServiceRevisionBitfield (Read/Write) ---- */
-    {
-        {ATT_BT_UUID_SIZE, characterUUID},
-        GATT_PERMIT_READ,
-        0,
-        &s_RevBitfieldProps
-    },
-    {
-        {ATT_UUID_SIZE, fido_ServiceRevisionBitfieldUUID}, /* idx 12 */
-        GATT_PERMIT_READ | GATT_PERMIT_WRITE,
-        0,
-        &s_RevBitfieldValue
     },
 };
 
@@ -283,6 +288,8 @@ bStatus_t fido_status_notify(uint16_t connHandle, const uint8_t *p_data, uint16_
     value = GATTServApp_ReadCharCfg(connHandle, s_StatusCCCD);
     if(!(value & GATT_CLIENT_CFG_NOTIFY))
     {
+        PRINT("[FIDO] notify SKIP: not subscribed (cccd=0x%04X)", value);
+        PRINT("%c", 10);
         return bleIncorrectMode;        /* 客户端未订阅 */
     }
 
@@ -298,6 +305,8 @@ bStatus_t fido_status_notify(uint16_t connHandle, const uint8_t *p_data, uint16_
     status = GATT_Notification(connHandle, &noti, FALSE);
     if(status != SUCCESS)
     {
+        PRINT("[FIDO] notify FAILED rc=0x%02X len=%u", (unsigned)status, (unsigned)len);
+        PRINT("%c", 10);
         /* 失败时必须释放，否则这块通知缓冲就泄漏了。
          * 一旦泄漏，后续通知会因内存池耗尽而全部失败 ——
          * 表现就是"响应发出一次后就再也发不出去"。 */
@@ -316,16 +325,32 @@ static bStatus_t fido_ReadAttrCB(uint16_t connHandle, gattAttribute_t *pAttr,
 {
     uint16_t uuid;
 
+    /* method 能区分客户端用的是哪种 ATT 操作：
+     *   0x0A READ_REQ              普通读单值
+     *   0x08 READ_BY_TYPE_REQ      按类型读（服务发现）
+     *   0x0C READ_BLOB_REQ         长读（值超过 MTU-1 时分段）
+     *   0x10 READ_BY_GROUP_TYPE    按组读（发现主服务，通常不进本回调）
+     *   0x04 FIND_INFO_REQ         发现描述符
+     * 客户端走到哪一步，从这里的 method 序列就能看出来。 */
+    PRINT("[FIDO] read  h=0x%04X method=0x%02X", pAttr->handle, method);
+    PRINT("%c", 10);
+
     if(gattPermitAuthorRead(pAttr->permissions))
     {
+        PRINT("[FIDO] read DENIED");
+        PRINT("%c", 10);
         return ATT_ERR_INSUFFICIENT_AUTHOR;
     }
 
-    /* 只处理 16-bit UUID 的读取（CCCD 与 fidoServiceRevision）。
-     * 客户端的其余读取由 GATT Server 直接用属性表里的值应答。 */
-    /* 128-bit UUID 的属性（ControlPointLength / RevisionBitfield）：
-     * gattAttribute_t 里没有"值长度"字段，读取时必须在这里显式设置 *pLen，
-     * 否则客户端会读到空值（实测就是这样踩到的）。 */
+    /* 128-bit UUID 的属性：gattAttribute_t 里没有"值长度"字段，GATT Server
+     * 不会自动填值，读取时必须在这里显式设置 *pLen 并拷贝数据。
+     *
+     * 注意：这个分支必须覆盖**所有** 128-bit 属性。此前只处理了
+     * ControlPointLength 与 RevisionBitfield，其余（fidoControlPoint、
+     * fidoStatus）落到末尾的 `return SUCCESS`，*pLen 未被赋值 —— 客户端若
+     * 读它们会拿到未初始化的长度（脏数据/越界），可能据此判定服务不合规。
+     *
+     * 按规范这两个特征本就是"只写"和"只通知"，读它们应当明确拒绝。 */
     if(pAttr->type.len != ATT_BT_UUID_SIZE)
     {
         if(pAttr->handle == s_ProfileAttrTbl[ATTR_IDX_CP_LENGTH_VALUE].handle)
@@ -333,14 +358,25 @@ static bStatus_t fido_ReadAttrCB(uint16_t connHandle, gattAttribute_t *pAttr,
             if(offset >= 2) { return ATT_ERR_INVALID_OFFSET; }
             *pLen = (uint16_t)(2 - offset);
             tmos_memcpy(pValue, s_CPLengthValue + offset, *pLen);
+            PRINT("[FIDO]   -> len=%u data=%02X %02X (CPLength)",
+                  (unsigned)*pLen, pValue[0], (pValue[1] ? pValue[1] : 0));
+            PRINT("%c", 10);
+            return SUCCESS;
         }
-        else if(pAttr->handle == s_ProfileAttrTbl[ATTR_IDX_REV_BITFIELD_VALUE].handle)
+        if(pAttr->handle == s_ProfileAttrTbl[ATTR_IDX_REV_BITFIELD_VALUE].handle)
         {
             if(offset >= 1) { return ATT_ERR_INVALID_OFFSET; }
             *pLen = 1;
             tmos_memcpy(pValue, &s_RevBitfieldValue, 1);
+            PRINT("[FIDO]   -> len=1 data=%02X (RevisionBitfield, FIDO2=0x20)",
+                  s_RevBitfieldValue);
+            PRINT("%c", 10);
+            return SUCCESS;
         }
-        return SUCCESS;
+        /* fidoControlPoint（只写）/ fidoStatus（只通知）不可读 */
+        PRINT("[FIDO] read DENIED: write/notify-only h=0x%04X", pAttr->handle);
+        PRINT("%c", 10);
+        return ATT_ERR_READ_NOT_PERMITTED;
     }
 
     uuid = BUILD_UINT16(pAttr->type.uuid[0], pAttr->type.uuid[1]);
@@ -353,7 +389,16 @@ static bStatus_t fido_ReadAttrCB(uint16_t connHandle, gattAttribute_t *pAttr,
         }
         *pLen = 2;
         tmos_memcpy(pValue, pAttr->pValue, 2);
+        PRINT("[FIDO]   -> len=2 cccd=%02X %02X", pValue[0], pValue[1]);
+        PRINT("%c", 10);
+        return SUCCESS;
     }
+
+    /* 其他 16-bit 属性（CCCD 之外的）由 GATT Server 用属性表里的值应答。
+     * 这里保持 SUCCESS —— 改判为错误会连服务声明的读取一起拒掉，
+     * 客户端就发现不了本服务了。 */
+    PRINT("[FIDO]   -> other 16-bit attr read (pass through)");
+    PRINT("%c", 10);
     return SUCCESS;
 }
 
@@ -362,8 +407,13 @@ static bStatus_t fido_WriteAttrCB(uint16_t connHandle, gattAttribute_t *pAttr,
                                   uint16_t offset, uint8_t method)
 {
     uint16_t uuid;
+    PRINT("[FIDO] write h=0x%04X len=%u method=0x%02X", pAttr->handle, len, method);
+    PRINT("%c", 10);
+
     if(gattPermitAuthorWrite(pAttr->permissions))
     {
+        PRINT("[FIDO] write DENIED");
+        PRINT("%c", 10);
         return ATT_ERR_INSUFFICIENT_AUTHOR;
     }
 

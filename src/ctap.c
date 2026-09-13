@@ -562,6 +562,8 @@ static uint8_t ctap_up_gate(uint8_t need_up)
     }
     if(auth_sm_get() != AUTH_WAIT_ACTIVE)
     {
+        PRINT("[CTAP] wait UP (%u ms)", (unsigned)AUTH_UP_TIMEOUT_MS);
+        PRINT("%c", 10);
         auth_sm_request_up();           /* 首次进入：发起等待并提示用户 */
     }
     return 1;                           /* 需要挂起 */

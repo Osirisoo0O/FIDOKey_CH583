@@ -53,6 +53,7 @@ void Main_Circulation()
         app_usb_hid_process();
         // 用户存在等待：推进按键/超时判断，并完成被挂起的 CTAP 操作
         auth_sm_poll();
+    Peripheral_PairingModePoll();       /* 长按 5 秒进入配对模式（FIDO 规范要求） */
         // 推进被挂起的 CTAP 操作（取得 UP 后重放 / 超时回填 0x3A）
         ctaphid_pending_poll();
         // BLE 侧：把待发内容按 MTU 逐帧送出（FIDO BLE 的发送调度）

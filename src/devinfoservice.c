@@ -94,7 +94,7 @@ static uint8_t devInfoSystemId[DEVINFO_SYSTEM_ID_LEN] = {0, 0, 0, 0, 0, 0, 0, 0}
 
 // Model Number String characteristic
 static uint8_t       devInfoModelNumberProps = GATT_PROP_READ;
-static const uint8_t devInfoModelNumber[] = "Model Number";
+static const uint8_t devInfoModelNumber[] = "CH583-FIDO2";
 
 // Serial Number String characteristic
 static uint8_t       devInfoSerialNumberProps = GATT_PROP_READ;
@@ -102,19 +102,19 @@ static const uint8_t devInfoSerialNumber[] = "Serial Number";
 
 // Firmware Revision String characteristic
 static uint8_t       devInfoFirmwareRevProps = GATT_PROP_READ;
-static const uint8_t devInfoFirmwareRev[] = "Firmware Revision";
+static const uint8_t devInfoFirmwareRev[] = "1.0.0";
 
 // Hardware Revision String characteristic
 static uint8_t       devInfoHardwareRevProps = GATT_PROP_READ;
-static const uint8_t devInfoHardwareRev[] = "Hardware Revision";
+static const uint8_t devInfoHardwareRev[] = "CH583M";
 
 // Software Revision String characteristic
 static uint8_t       devInfoSoftwareRevProps = GATT_PROP_READ;
-static const uint8_t devInfoSoftwareRev[] = "Software Revision";
+static const uint8_t devInfoSoftwareRev[] = "SecureKey 1.0.0";
 
 // Manufacturer Name String characteristic
 static uint8_t       devInfoMfrNameProps = GATT_PROP_READ;
-static const uint8_t devInfoMfrName[] = "Manufacturer Name";
+static const uint8_t devInfoMfrName[] = "SecureKey";
 
 // IEEE 11073-20601 Regulatory Certification Data List characteristic
 static uint8_t       devInfo11073CertProps = GATT_PROP_READ;

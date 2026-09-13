@@ -56,6 +56,14 @@ extern void Peripheral_Init(void);
 extern uint16_t Peripheral_ProcessEvent(uint8_t task_id, uint16_t events);
 void app_usb_notify(uint8_t *SendBuf, uint8_t l);
 
+/* FIDO 配对模式轮询（CTAP 2.1 规范 §11.4.7/§11.4.13.2）：
+ * 检测长按 KEY2 满 5 秒进入配对模式，30 秒无配对自动退出。
+ * 需在主循环中持续调用。 */
+extern void Peripheral_PairingModePoll(void);
+
+/* 客户端有活动时续上配对窗口（避免交互中途配对模式过期） */
+extern void Peripheral_PairingKeepAlive(void);
+
 /*********************************************************************
 *********************************************************************/
 

@@ -16,7 +16,9 @@
 #include "devinfoservice.h"
 #include "gattprofile.h"
 #include "peripheral.h"
-#include "ble_usb_service.h"
+#include "KEY.h"      /* HAL_PUSH_BUTTON2() = KEY2 = PB4 */
+#include "auth_sm.h"  /* auth_sm_get()：判断当前是否在等 UP */
+#include "LED.h"      /* 配对模式的 LED 提示 */
 #include "fido_service.h"
 #include "ble_transport.h"
 #include "app_usb.h"
@@ -48,11 +50,44 @@
 // General discoverable mode advertises indefinitely
 #define DEFAULT_DISCOVERABLE_MODE            GAP_ADTYPE_FLAGS_GENERAL
 
+/* ---------------------------------------------------------------------------
+ * FIDO 配对模式（CTAP 2.1 规范 §11.4.7 / §11.4.13.2）
+ *
+ * 规范要求：
+ *   "The method to put the authenticator into Pairing Mode should be such that
+ *    it is not easy for the user to do accidentally especially if the pairing
+ *    method is Just Works. ... A visible or audible cue that the authenticator
+ *    is in Pairing Mode should be considered."
+ *   "When advertising in pairing mode, the authenticator SHALL either:
+ *    (1) set the LE Limited Mode bit to zero and the LE General Discoverable
+ *        bit to one OR (2) set the LE Limited Mode bit to one and the LE
+ *        General Discoverable bit to zero.
+ *    When advertising in non-pairing mode, the authenticator SHALL set both
+ *    the LE Limited Mode bit and the LE General Discoverable Mode bit to zero."
+ *
+ * 实现：长按 KEY2(PB4) 满 PAIRING_HOLD_MS 才进入（"不易误触发"），
+ *       进入后 LED 快闪（可见提示），30 秒内无配对则自动退出。
+ *       同时在广播的 Service Data 里置 bit7（客户端主要靠它判断）。
+ * ------------------------------------------------------------------------- */
+#define PAIRING_HOLD_MS         5000    /* 长按满 5 秒进入配对模式 */
+#define PAIRING_SAMPLE_MS       50      /* 按键采样间隔（节流） */
+#define PAIRING_WINDOW_MS       120000  /* 配对模式持续 120 秒（初次进入后）*/
+/* 说明：窗口原本 30 秒，实测太短 —— 从长按到客户端完成"扫描->连接->配对
+ * ->特征发现"很容易超过 30 秒，一旦窗口在交互中途过期，客户端会认为
+ * "设备退出了配对模式"而就此停止（日志里 pairing window expired 之后
+ * 客户端再无任何动作，多次重现）。改为 120 秒，并且只要设备在活动
+ * （连接着、有 FIDO 读写）就自动续期。 */
+
 // Minimum connection interval (units of 1.25ms, 6=7.5ms)
 #define DEFAULT_DESIRED_MIN_CONN_INTERVAL    6
 
 // Maximum connection interval (units of 1.25ms, 100=125ms)
-#define DEFAULT_DESIRED_MAX_CONN_INTERVAL    200
+/* 连接间隔上限：原为 200（=250ms），对 FIDO 交互太慢 ——
+ * 日志里实测协商到 Int c0（192 = 240ms），客户端每次读写特征都要等一个
+ * 连接事件，一次完整的发现+订阅+请求会累积成数秒，容易触发客户端超时
+ * （表现为读完 CPLength 就放弃）。改为 24（=30ms），与大多数 FIDO 认证器
+ * 和 BLE 外设的常用值一致；下限 6（=7.5ms）不变，由客户端决定最终值。 */
+#define DEFAULT_DESIRED_MAX_CONN_INTERVAL    24
 
 // Slave latency to use parameter update
 #define DEFAULT_DESIRED_SLAVE_LATENCY        0
@@ -66,7 +101,13 @@
  * bleNotConnected、CCCD 被清零）。
  *
  * 规范上限是 32 秒（3200）。这里取 6 秒，给耗时操作留足余量。 */
-#define DEFAULT_DESIRED_CONN_TIMEOUT         600
+/* 连接监督超时：600（6 秒）-> 3000（30 秒）。
+ * 6 秒对交互式调试太短 —— 扫描、配对、服务发现再加上人工看输出，
+ * 很容易超过，连接会被判超时而断开（实测 Windows 上表现为
+ * OSError 0x800704CD"远程设备已断开"，紧跟在服务发现之后）。
+ * BLE 规范允许的最大值是 3200（32 秒），这里取 3000 留一点余量。
+ * 注意：这是"建议值"，最终由客户端决定。 */
+#define DEFAULT_DESIRED_CONN_TIMEOUT         3000
 
 // Company Identifier: WCH
 #define WCH_COMPANY_ID                       0x07D7
@@ -93,27 +134,38 @@
 static uint8_t Peripheral_TaskID = INVALID_TASK_ID; // Task ID for internal task/event processing
 
 // GAP - SCAN RSP data (max size = 31 bytes)
+//
+// 设备名从 "Simple Peripheral" 缩短为 "SecureKey"：腾出 8 字节给下面的
+// FIDO Service Data 字段（Service Data 是规范强烈建议的，见其说明）。
 static uint8_t scanRspData[] = {
     // complete name
-    0x12, // length of this data
+    0x0A, // length: 1(type) + 9(name)
     GAP_ADTYPE_LOCAL_NAME_COMPLETE,
-    'S',
-    'i',
-    'm',
-    'p',
-    'l',
-    'e',
-    ' ',
-    'P',
-    'e',
-    'r',
-    'i',
-    'p',
-    'h',
-    'e',
-    'r',
-    'a',
-    'l',
+    'S', 'e', 'c', 'u', 'r', 'e', 'K', 'e', 'y',
+
+    /* FIDO Service Data —— CTAP 2.1 规范 §11.4.7 "Authenticator Advertising
+     * Format" 的要求：
+     *
+     *   "Some client platforms (most notably iOS) do not expose the AD Flag
+     *    LE Limited and General Discoverable Mode bits to applications. For
+     *    this reason, authenticators are also strongly RECOMMENDED to include
+     *    the Service Data field in the Scan Response.
+     *    The first 2 bytes contain the FIDO Service UUID, the following bytes
+     *    are flag bytes."
+     *
+     *   bit7 = Device is in pairing mode
+     *   bit6 = Device requires Passkey Entry
+     *
+     * 为什么必须有：客户端的"请按住按键 5 秒"提示就是这个判断的产物 ——
+     * 它读不到"设备处于配对模式"的信号就不肯继续（表现为配对成功后
+     * 停在原地，一步 GATT 操作都不做）。
+     */
+    0x04,                                  // length: 1(type) + 2(uuid) + 1(flags)
+    GAP_ADTYPE_SERVICE_DATA,               // 0x16
+    LO_UINT16(FIDO_SERVICE_UUID16),
+    HI_UINT16(FIDO_SERVICE_UUID16),
+    FIDO_SERVICE_DATA_FLAGS,
+
     // connection interval range
     0x05, // length of this data
     GAP_ADTYPE_SLAVE_CONN_INTERVAL_RANGE,
@@ -144,27 +196,46 @@ static uint8_t advertData[] = {
     // （WCH 栈不采用 BLE 规范的分段反序；详见 fido_service.c 的说明）
     0x11,                      // length: 1(type) + 16(uuid)
     GAP_ADTYPE_128BIT_COMPLETE,
+    0xfb, 
+    0x34, 
+    0x9b,
+    0x5f, 
+    0x80,
+    0x00, 
+
+    0x00,
+    0x80, 
+    
+    0x00, 
+    0x10, 
+    
+    0x00, 0x00, 
     0xfd, 
     0xff,
-    0x00, 0x00, 
     0x00, 0x00,     
-    0x00, 0x10, 
-    0x80, 
-    0x00,
-   
-    0x00, 0x80,
-    0x5f, 0x9b,
-    0x34, 0xfb, 
 
-    // WCH 示例服务，暂时保留：在 FIDO 服务尚未跑通前，它是"蓝牙连接本身
-    // 是否正常"的参照物（见 docs/BLE侧实现分析.md §3）
-    0x03,                  // length of this data
-    GAP_ADTYPE_16BIT_MORE, // some of the UUID's, but not all
-    LO_UINT16(SIMPLEPROFILE_SERV_UUID),
-    HI_UINT16(SIMPLEPROFILE_SERV_UUID)
+    // 说明：原先这里还有 WCH 示例服务的 16-bit UUID（SimpleProfile），
+    // 作为"蓝牙连接本身是否正常"的参照物保留。FIDO 服务已跑通且广播空间
+    // 紧张（Service Data 要占位置），故移除。
 };
 
-/* 说明：上面两段合计 3 + 18 + 4 = 25 字节，未超过 B_MAX_ADV_LEN(31)。 */
+/* 说明：advertData 3 + 18 = 21 字节，scanRspData 11 + 5 + 6 + 3 = 25 字节，
+ * 均未超过 B_MAX_ADV_LEN(31)。 */
+
+/* ---- FIDO 配对模式状态 ---- */
+static uint8_t  s_pairing_mode  = 0;    /* 0=非配对模式, 1=配对模式 */
+static uint32_t s_pairing_deadline = 0;
+static uint32_t s_key_sample    = 0;    /* 长按检测的上次采样时刻 */
+static uint32_t s_key_hold_start = 0;   /* 按住起点；0 = 未按住 */
+
+/* 广播数据里的固定偏移（改动广播内容时必须同步更新这里）：
+ *   advertData[2]     = AD Flags 字节（GAP_ADTYPE_FLAGS 的值所在处）
+ *   scanRspData[12]   = Service Data 里 FIDO 标志字节
+ *                       0x0A, NAME(9)  →  11 字节
+ *                       0x04, 0x16, FD, FF, FLAGS  →  flags 在第 11+4 = 15 处
+ * 为避免手算出错，这里用宏并在 set 时断言（见 Peripheral_SetPairingMode）。 */
+#define ADVERT_FLAGS_OFFSET     2
+#define SCANRSP_SD_FLAGS_OFFSET 15
 
 // GAP GATT Attributes
 static uint8_t attDeviceName[GAP_DEVICE_NAME_LEN] = "Simple Peripheral";
@@ -172,20 +243,21 @@ static uint8_t attDeviceName[GAP_DEVICE_NAME_LEN] = "Simple Peripheral";
 // Connection item list
 static peripheralConnItem_t peripheralConnList;
 
-static uint8_t peripheralMTU = ATT_MTU_SIZE;
+/* 注意类型必须是 uint16_t：ATT_MTU 可达 517（BLE 5.0），
+ * uint8_t 会在 MTU > 255 时溢出（256 变 0），导致 ble_transport_set_mtu()
+ * 因"mtu < FIDO_BLE_DEFAULT_MTU"而直接返回，fidoControlPointLength 停在
+ * 初始的 20（23-3）。这就是实测中 MTU 协商为 256 却读出 0x14 的原因。 */
+static uint16_t peripheralMTU = ATT_MTU_SIZE;
 /*********************************************************************
  * LOCAL FUNCTIONS
  */
 static void Peripheral_ProcessTMOSMsg(tmos_event_hdr_t *pMsg);
 static void peripheralStateNotificationCB(gapRole_States_t newState, gapRoleEvent_t *pEvent);
 static void performPeriodicTask(void);
-static void simpleProfileChangeCB(uint8_t paramID, uint8_t *pValue, uint16_t len);
 static void peripheralParamUpdateCB(uint16_t connHandle, uint16_t connInterval,
                                     uint16_t connSlaveLatency, uint16_t connTimeout);
 static void peripheralInitConnItem(peripheralConnItem_t *peripheralConnList);
 static void peripheralRssiCB(uint16_t connHandle, int8_t rssi);
-static void peripheralChar4Notify(uint8_t *pValue, uint16_t len);
-void ble_usb_ServiceEvt(uint16_t connection_handle, ble_usb_evt_t *p_evt);
 
 /*********************************************************************
  * PROFILE CALLBACKS
@@ -205,8 +277,132 @@ static gapRolesBroadcasterCBs_t Broadcaster_BroadcasterCBs = {
 };
 
 /** 配对状态回调：把配对过程打出来，便于定位"配对卡在哪一步" */
+/* ---------------------------------------------------------------------------
+ * FIDO 配对模式状态机
+ * ------------------------------------------------------------------------- */
+
+/* 打开/关闭配对模式：同步更新广播的 Service Data 标志与 AD Flags。 */
+static void Peripheral_SetPairingMode(uint8_t on)
+{
+    uint8_t flags;
+
+    if(s_pairing_mode == on)
+    {
+        return;
+    }
+    s_pairing_mode = on;
+
+    /* 1) Service Data 里的 FIDO 标志字节：bit7 = 处于配对模式。
+     *    这是客户端（iOS/Android）判断设备能否配对的主要依据 ——
+     *    规范指出平台通常不向应用暴露 AD Flags 的 Discoverable 位。 */
+    scanRspData[SCANRSP_SD_FLAGS_OFFSET] =
+        on ? FIDO_SD_BIT_PAIRING_MODE : 0x00;
+    GAPRole_SetParameter(GAPROLE_SCAN_RSP_DATA, sizeof(scanRspData), scanRspData);
+
+    /* 2) AD Flags（规范 §11.4.7）：
+     *      配对模式   -> General Discoverable = 1
+     *      非配对模式 -> Limited 与 General 均清零 */
+    flags = GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED;
+    if(on)
+    {
+        flags |= GAP_ADTYPE_FLAGS_GENERAL;
+    }
+    advertData[ADVERT_FLAGS_OFFSET] = flags;
+    GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(advertData), advertData);
+
+    /* 3) 可见提示（规范要求"a visible or audible cue"）：快闪 2Hz */
+    if(on)
+    {
+        HalLedBlink(HAL_LED_1, 0, 50, 250);
+        s_pairing_deadline = TMOS_GetSystemClock() + PAIRING_WINDOW_MS;
+    }
+    else
+    {
+        HalLedSet(HAL_LED_1, HAL_LED_MODE_ON);
+        s_pairing_deadline = 0;
+    }
+
+    PRINT("[BLE] pairing mode %s", on ? "ON (long-press detected)" : "OFF");
+    PRINT("%c", 10);
+}
+
+/* 供 ble_transport 在收到 FIDO 请求/读写时调用：只要客户端还在活动，
+ * 就续上配对窗口，避免交互中途"配对模式过期"。
+ * 若当前不在配对模式则什么都不做（不能凭空进入）。 */
+void Peripheral_PairingKeepAlive(void)
+{
+    if(s_pairing_mode)
+    {
+        s_pairing_deadline = TMOS_GetSystemClock() + PAIRING_WINDOW_MS;
+    }
+}
+
+
+void Peripheral_PairingModePoll(void)
+{
+    uint32_t now = TMOS_GetSystemClock();
+
+    /* 采样节流：主循环是忙等的 */
+    if((now - s_key_sample) < PAIRING_SAMPLE_MS)
+    {
+        return;
+    }
+    s_key_sample = now;
+
+    if(HAL_PUSH_BUTTON2())
+    {
+        if(s_key_hold_start == 0)
+        {
+            s_key_hold_start = now;
+        }
+
+        /* 正在等待 UP 时不做长按判定：那段时间按键的语义是"用户在场确认"，
+         * 若同时触发配对模式会误操作（auth_sm 已把按键消费掉了）。 */
+        if(!s_pairing_mode && auth_sm_get() != AUTH_WAIT_ACTIVE)
+        {
+            if((now - s_key_hold_start) >= PAIRING_HOLD_MS)
+            {
+                Peripheral_SetPairingMode(1);
+            }
+        }
+    }
+    else
+    {
+        s_key_hold_start = 0;
+    }
+
+    /* 配对模式超时退出 */
+    if(s_pairing_mode && s_pairing_deadline != 0 &&
+       (int32_t)(now - s_pairing_deadline) >= 0)
+    {
+        Peripheral_SetPairingMode(0);
+        PRINT("[BLE] pairing window expired");
+        PRINT("%c", 10);
+    }
+}
+
 static void Peripheral_PairStateCB(uint16_t connHandle, uint8_t state, uint8_t status)
 {
+    PRINT("[BLE] pair state=%u status=0x%02X conn=%u", state, (unsigned)status, connHandle);
+    PRINT("%c", 10);
+
+    /* 注意：这里**不要**在配对成功时退出配对模式。
+     *
+     * 曾经这样做过（理由是"避免长期停在可配对状态"），但实测发现：客户端在配对
+     * 完成后仍会继续做特征发现/服务遍历，此时若广播里的 Service Data bit7 已经
+     * 清零，它会认为"设备退出了配对模式"而直接放弃 —— 表现为连上、MTU 交换完毕
+     * 之后一步 GATT 操作都不做（日志里 pairing mode OFF 紧跟在 pair state=3 之后）。
+     *
+     * 配对模式的退出交给两条既有路径：
+     *   1) 窗口超时（PAIRING_WINDOW_MS，期间只要客户端有活动就会自动续期）
+     *   2) 设备重启
+     * 这样客户端在整个交互期间都能看到 bit7=1。规范也只要求"进入配对模式的动作
+     * 不易误触发 + 有可见提示"，并未要求配对成功即退出。 */
+    if(state == GAPBOND_PAIRING_STATE_BOND_SAVED)
+    {
+        PRINT("[BLE] bond saved (pairing mode stays ON until window expires)");
+        PRINT("%c", 10);
+    }
 }
 
 // GAP Bond Manager Callbacks
@@ -215,10 +411,6 @@ static gapBondCBs_t Peripheral_BondMgrCBs = {
     Peripheral_PairStateCB         // Pairing / Bonding state Callback
 };
 
-// Simple GATT Profile Callbacks
-static simpleProfileCBs_t Peripheral_SimpleProfileCBs = {
-    simpleProfileChangeCB // Characteristic value change callback
-};
 /*********************************************************************
  * PUBLIC FUNCTIONS
  */
@@ -251,6 +443,14 @@ void Peripheral_Init()
         GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t), &initial_advertising_enable);
         GAPRole_SetParameter(GAPROLE_SCAN_RSP_DATA, sizeof(scanRspData), scanRspData);
         GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(advertData), advertData);
+
+        /* 上电后处于"非配对模式"：AD Flags 两位清零、Service Data bit7 清零。
+         * 用户需长按 5 秒才进入配对模式（规范要求进入动作"不易误触发"）。
+         * 这里先按非配对模式改写广播数据，随后由协议栈启用广播。 */
+        advertData[ADVERT_FLAGS_OFFSET] = GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED;
+        scanRspData[SCANRSP_SD_FLAGS_OFFSET] = 0x00;
+        GAPRole_SetParameter(GAPROLE_SCAN_RSP_DATA, sizeof(scanRspData), scanRspData);
+        GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(advertData), advertData);
         GAPRole_SetParameter(GAPROLE_MIN_CONN_INTERVAL, sizeof(uint16_t), &desired_min_interval);
         GAPRole_SetParameter(GAPROLE_MAX_CONN_INTERVAL, sizeof(uint16_t), &desired_max_interval);
     }
@@ -272,18 +472,27 @@ void Peripheral_Init()
 
     // Setup the GAP Bond Manager
     //
-    // 注意：本配置（mitm=TRUE + DISPLAY_ONLY）要求设备"显示配对密码"，
-    // 而 Peripheral_BondMgrCBs 的 passcodeCB 目前是 NULL，设备实际无法显示。
-    // 曾试过改成 Just Works（mitm=FALSE + NO_INPUT_NO_OUTPUT），但那会让
-    // 使用方难以判断状态，故恢复为本来的配置。
+    // 配对级别：**Security Mode 1, Level 2**（加密的未认证配对，即 Just Works）。
     //
-    // 若后续遇到配对卡住，这里是最先要检查的地方。
+    // 依据 CTAP 2.1 规范（BLE 传输章节）：
+    //   "For Bluetooth Low Energy Technology connections, the authenticator
+    //    [SHALL use] Security Mode 1, Level 2 (unauthenticated pairing with
+    //    encryption) or Security Mode 1, Level 3 (authenticated pairing with
+    //    encryption) before any FIDO messages."
+    // 规范允许 Level 2 或 Level 3。本设备选 Level 2。
+    //
+    // 为什么不是 Level 3：那要求"认证配对"（显示/输入配对码或带外信道），
+    // 而 Peripheral_BondMgrCBs 的 passcodeCB 为 NULL —— 设备不具备该能力。
+    // 原先的 mitm=TRUE + DISPLAY_ONLY 属于"声称 Level 3 却无法完成认证"，
+    // 客户端会在配对阶段卡住（实测 Android 提示"按住按键 5 秒"后无后续）。
+    //
+    // 另：规范要求"只接受已绑定客户端的连接"，由 bonding=TRUE 满足。
     {
         uint32_t passkey = 0; // passkey "000000"
         uint8_t  pairMode = GAPBOND_PAIRING_MODE_WAIT_FOR_REQ;
-        uint8_t  mitm = TRUE;
+        uint8_t  mitm = FALSE;
         uint8_t  bonding = TRUE;
-        uint8_t  ioCap = GAPBOND_IO_CAP_DISPLAY_ONLY;
+        uint8_t  ioCap = GAPBOND_IO_CAP_NO_INPUT_NO_OUTPUT;
         GAPBondMgr_SetParameter(GAPBOND_PERI_DEFAULT_PASSCODE, sizeof(uint32_t), &passkey);
         GAPBondMgr_SetParameter(GAPBOND_PERI_PAIRING_MODE, sizeof(uint8_t), &pairMode);
         GAPBondMgr_SetParameter(GAPBOND_PERI_MITM_PROTECTION, sizeof(uint8_t), &mitm);
@@ -295,32 +504,15 @@ void Peripheral_Init()
     GGS_AddService(GATT_ALL_SERVICES);           // GAP
     GATTServApp_AddService(GATT_ALL_SERVICES);   // GATT attributes
     DevInfo_AddService();                        // Device Information Service
-    SimpleProfile_AddService(GATT_ALL_SERVICES); // Simple GATT Profile
-    ble_usb_add_service(ble_usb_ServiceEvt);
-    /* FIDO GATT 服务由传输层负责注册（它要把自己的事件回调接上），
-     * 这里不再单独调用 fido_add_service，避免重复注册同一服务。 */
+    /* 说明（FIDO 认证器的服务清单，CTAP 2.1 规范 §11.4.5）：
+     *   必需 —— GAP、DIS（上面两行）、FIDO GATT 服务（ble_transport_init 里注册）
+     *   可选 —— GATT attributes（GATTServApp）
+     * 原先这里还注册了 WCH 示例的 SimpleProfile 和一个已废弃的 ble_usb_service，
+     * 两者都不是规范要求，且在服务发现时会多出无关条目，故移除。 */
     ble_transport_init();
-
-    // Setup the SimpleProfile Characteristic Values
-    {
-        uint8_t charValue1[SIMPLEPROFILE_CHAR1_LEN] = {1};
-        uint8_t charValue2[SIMPLEPROFILE_CHAR2_LEN] = {2};
-        uint8_t charValue3[SIMPLEPROFILE_CHAR3_LEN] = {3};
-        uint8_t charValue4[SIMPLEPROFILE_CHAR4_LEN] = {4};
-        uint8_t charValue5[SIMPLEPROFILE_CHAR5_LEN] = {1, 2, 3, 4, 5};
-
-        SimpleProfile_SetParameter(SIMPLEPROFILE_CHAR1, SIMPLEPROFILE_CHAR1_LEN, charValue1);
-        SimpleProfile_SetParameter(SIMPLEPROFILE_CHAR2, SIMPLEPROFILE_CHAR2_LEN, charValue2);
-        SimpleProfile_SetParameter(SIMPLEPROFILE_CHAR3, SIMPLEPROFILE_CHAR3_LEN, charValue3);
-        SimpleProfile_SetParameter(SIMPLEPROFILE_CHAR4, SIMPLEPROFILE_CHAR4_LEN, charValue4);
-        SimpleProfile_SetParameter(SIMPLEPROFILE_CHAR5, SIMPLEPROFILE_CHAR5_LEN, charValue5);
-    }
 
     // Init Connection Item
     peripheralInitConnItem(&peripheralConnList);
-
-    // Register callback with SimpleGATTprofile
-    SimpleProfile_RegisterAppCBs(&Peripheral_SimpleProfileCBs);
 
     // Register receive scan request callback
     GAPRole_BroadcasterSetCB(&Broadcaster_BroadcasterCBs);
@@ -522,6 +714,10 @@ static void Peripheral_LinkEstablished(gapRoleEvent_t *pEvent)
     else
     {
         peripheralConnList.connHandle = event->connectionHandle;
+        PRINT("[BLE] link ESTABLISHED conn=%u timeout=%u",
+              event->connectionHandle, event->connTimeout);
+        PRINT("%c", 10);
+        Peripheral_PairingKeepAlive();   /* 有连接即续期 */
         /* 通知要发到这个连接上，传输层必须知道句柄 */
         ble_transport_set_conn(event->connectionHandle);
         peripheralConnList.connInterval = event->connInterval;
@@ -553,6 +749,10 @@ static void Peripheral_LinkEstablished(gapRoleEvent_t *pEvent)
 static void Peripheral_LinkTerminated(gapRoleEvent_t *pEvent)
 {
     gapTerminateLinkEvent_t *event = (gapTerminateLinkEvent_t *)pEvent;
+    PRINT("[BLE] link TERMINATED conn=%u reason=0x%02X",
+          event->connectionHandle, event->reason);
+    PRINT("%c", 10);
+
     if(event->connectionHandle == peripheralConnList.connHandle)
     {
         peripheralConnList.connHandle = GAP_CONNHANDLE_INIT;
@@ -720,136 +920,6 @@ static void performPeriodicTask(void)
     /* 按键改由官方 HAL 的 KEY 服务管理（HAL_KEY=TRUE 时 HAL_Init() 会调
      * HAL_KeyInit() 配置 KEY2/PB4 为上拉输入）。用户存在的判定与 LED 提示
      * 统一由 auth_sm 负责，这里不再自行轮询，避免与 UP 等待期间的 LED 状态打架。 */
-    
-    uint8_t notiData[SIMPLEPROFILE_CHAR4_LEN] = {0x88};
-    peripheralChar4Notify(notiData, SIMPLEPROFILE_CHAR4_LEN);
-}
-
-/*********************************************************************
- * @fn      peripheralChar4Notify
- *
- * @brief   Prepare and send simpleProfileChar4 notification
- *
- * @param   pValue - data to notify
- *          len - length of data
- *
- * @return  none
- */
-static void peripheralChar4Notify(uint8_t *pValue, uint16_t len)
-{
-    attHandleValueNoti_t noti;
-    if(len > (peripheralMTU - 3))
-    {
-        PRINT("Too large noti\n");
-        return;
-    }
-    noti.len = len;
-    noti.pValue = GATT_bm_alloc(peripheralConnList.connHandle, ATT_HANDLE_VALUE_NOTI, noti.len, NULL, 0);
-    if(noti.pValue)
-    {
-        tmos_memcpy(noti.pValue, pValue, noti.len);
-        if(simpleProfile_Notify(peripheralConnList.connHandle, &noti) != SUCCESS)
-        {
-            GATT_bm_free((gattMsg_t *)&noti, ATT_HANDLE_VALUE_NOTI);
-        }
-    }
-}
-
-/*********************************************************************
- * @fn      simpleProfileChangeCB
- *
- * @brief   Callback from SimpleBLEProfile indicating a value change
- *
- * @param   paramID - parameter ID of the value that was changed.
- *          pValue - pointer to data that was changed
- *          len - length of data
- *
- * @return  none
- */
-static void simpleProfileChangeCB(uint8_t paramID, uint8_t *pValue, uint16_t len)
-{
-    switch(paramID)
-    {
-        case SIMPLEPROFILE_CHAR1:
-        {
-            uint8_t newValue[SIMPLEPROFILE_CHAR1_LEN];
-            tmos_memcpy(newValue, pValue, len);
-            PRINT("profile ChangeCB CHAR1.. \n");
-            break;
-        }
-
-        case SIMPLEPROFILE_CHAR3:
-        {
-            uint8_t newValue[SIMPLEPROFILE_CHAR3_LEN];
-            tmos_memcpy(newValue, pValue, len);
-            PRINT("profile ChangeCB CHAR3..\n");
-            break;
-        }
-
-        default:
-            // should not reach here!
-            break;
-    }
-}
-
-/*********************************************************************
- * @fn      ble_usb_ServiceEvt
- *
- * @brief   ble usb service callback handler
- *
- * @return  none
- */
-void ble_usb_ServiceEvt(uint16_t connection_handle, ble_usb_evt_t *p_evt)
-{
-    switch(p_evt->type)
-    {
-        case BLE_USB_EVT_TX_NOTI_DISABLED:
-            PRINT("%02x:bleusb_EVT_TX_NOTI_DISABLED\r\n", connection_handle);
-            break;
-        case BLE_USB_EVT_TX_NOTI_ENABLED:
-            PRINT("%02x:bleusb_EVT_TX_NOTI_ENABLED\r\n", connection_handle);
-            break;
-        case BLE_USB_EVT_BLE_DATA_RECIEVED:
-            PRINT("BLE RX DATA len:%d\r\n", p_evt->data.length);
-
-            /* 原为官方 ble-usb-cdc 示例的「BLE 数据透传到 USB」。
-             * 在 FIDO2 双模下这条路径是错的：BLE 侧的 CTAP 应当由本设备自己处理
-             * （CTAP 2.3 的 BLE 传输帧格式与 CTAPHID 不同，见计划 3.7），
-             * 转发给 USB 主机只会往 HID IN 端点注入主机无法理解的报文。
-             * 因此不再转发；待 3.7 实现 BLE CTAP 适配层后，把数据接到设备自身的
-             * 消息层（而不是 USB）即可。 */
-            (void)p_evt->data.p_data;
-
-            break;
-        default:
-            break;
-    }
-}
-
-/*********************************************************************
- * @fn      app_usb_notify
- *
- * @brief   app usb service callback handler
- *
- * @return  none
- */
-void app_usb_notify(uint8_t *SendBuf, uint8_t l)
-{
-    uint8_t result;
-    static attHandleValueNoti_t noti;
-    noti.len = l;
-    noti.pValue = GATT_bm_alloc(peripheralConnList.connHandle, ATT_HANDLE_VALUE_NOTI, noti.len, NULL, 0);
-    if(noti.pValue != NULL)
-    {
-        tmos_memcpy(noti.pValue, SendBuf, noti.len);
-        result = ble_usb_notify(peripheralConnList.connHandle, &noti, 0);
-        if(result != SUCCESS)
-        {
-            GATT_bm_free((gattMsg_t *)&noti, ATT_HANDLE_VALUE_NOTI);
-        }
-    }
 }
 
 
-/*********************************************************************
-*********************************************************************/

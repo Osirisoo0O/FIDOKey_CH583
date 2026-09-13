@@ -26,6 +26,7 @@
 #include "string.h"
 #include "ble_transport.h"
 #include "fido_service.h"
+#include "peripheral.h"   /* Peripheral_PairingKeepAlive() */
 #include "ctap.h"
 #include "auth_sm.h"
 #include "debug_log.h"
@@ -262,6 +263,9 @@ static void ble_transport_event_cb(fido_evt_t *p_evt)
     switch(p_evt->type)
     {
         case FIDO_EVT_CONTROL_POINT_WRITE:
+            /* 客户端在发请求 == 它在正常使用设备：续上配对窗口，
+             * 避免长交互（注册/认证）中途窗口过期导致客户端放弃。 */
+            Peripheral_PairingKeepAlive();
             ble_transport_on_write(p_evt->connHandle, p_evt->data, p_evt->len);
             break;
 
@@ -292,11 +296,16 @@ static void handle_frame(void)
     {
         case FIDO_BLE_CMD_PING:
             /* 按规范原样回显：STAT 与请求的 CMD 相同 */
+            PRINT("[BLE] PING rx len=%u -> echo", (unsigned)len);
+            PRINT("%c", 10);
             send_frame(FIDO_BLE_CMD_PING, data, len);
             break;
 
         case FIDO_BLE_CMD_MSG:
         {
+            PRINT("[BLE] MSG rx len=%u ctap_cmd=%02X",
+                  (unsigned)rx_total, (rx_total > 0) ? rx_buf[0] : 0);
+            PRINT("%c", 10);
             /* MSG 的载荷就是 CTAP2 消息： [CTAP cmd(1B)] [CBOR 参数...]
              * 响应同样是 CTAP2 消息： [status(1B)] [CBOR 响应...]
              *
@@ -310,6 +319,10 @@ static void handle_frame(void)
             uint8_t *resp     = tx_buf + 3;     /* 跳过 3 字节帧头，稍后批量装帧 */
             uint16_t resp_len = 0;
             uint8_t  status;
+
+            PRINT("[BLE RX] len=%u first=%02X cmd=%02X",
+                  (unsigned)rx_total, rx_buf[0], (uint8_t)(rx_buf[0] & 0xFF));
+            PRINT("%c", 10);
 
             if(len < 1)
             {
@@ -329,6 +342,8 @@ static void handle_frame(void)
             {
                 /* 等用户按键：保留请求报文（仍在 rx_buf 里），不发响应。
                  * 取得 UP 后由 ble_transport_pending_poll() 重放。 */
+                PRINT("[BLE] ctap pending (UP needed)");
+                PRINT("%c", 10);
                 s_pend_conn      = s_conn;
                 s_ctap_pending   = 1;
                 s_keepalive_last = TMOS_GetSystemClock();

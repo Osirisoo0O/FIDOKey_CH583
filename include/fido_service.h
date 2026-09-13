@@ -27,6 +27,26 @@ extern "C" {
  */
 
 /* fidoServiceRevisionBitfield 的位定义 */
+/* FIDO 服务的 16-bit UUID：0xFFFD（BLE 规范分配给 FIDO 的短 UUID）。
+ * 广播里的 Service Data 字段用它，128-bit UUID 的完整形式为
+ * 0000fffd-0000-1000-8000-00805f9b34fb。 */
+#define FIDO_SERVICE_UUID16         0xFFFD
+
+/* 广播 Service Data 里的标志字节（CTAP 2.1 规范 §11.4.7）：
+ *
+ *   bit7 = Device is in pairing mode
+ *   bit6 = Device requires Passkey Entry
+ *
+ * 客户端（尤其 iOS/Android）读不到 AD Flags 的 Discoverable 位，靠这里的
+ * bit7 判断"设备是否处于配对模式"——它决定客户端会不会继续往下走。
+ *
+ * 当前实现（阶段 1）：恒为 bit7=1，即"始终处于配对模式"，与本项目原先
+ * GAP_ADTYPE_FLAGS_GENERAL 的语义一致。
+ * 阶段 2 会改为随配对模式状态机动态变化（上电清零，长按 5 秒后置位）。 */
+#define FIDO_SERVICE_DATA_FLAGS     0x80    /* bit7: 处于配对模式 */
+#define FIDO_SD_BIT_PAIRING_MODE    0x80    /* bit7 */
+#define FIDO_SD_BIT_PASSKEY_ENTRY   0x40    /* bit6 */
+
 #define FIDO_REV_BIT_U2F_V11        0x80    /* bit7 */
 #define FIDO_REV_BIT_U2F_V12        0x40    /* bit6 */
 #define FIDO_REV_BIT_FIDO2          0x20    /* bit5 —— 本实现只支持这个 */

@@ -205,7 +205,7 @@ python tools/fido2_server_test.py    # 完整服务端验证（最接近真实�
 | `SK_LOG_ENABLE` | `0` | 串口日志（见 `debug_log.h`） |
 | `CTAPHID_DUMP` | 未定义 | 打印 CTAP 请求/响应全文，**排障用，会阻塞串口** |
 | `SK_SIG_DER` | `1` | 签名输出格式，见下 |
-| `BLE_BUFF_MAX_LEN` | `100` | BLE 数据包缓冲，决定 `ATT_MTU = 值 - 4`（默认 27 → MTU 23 过小）|
+| `BLE_BUFF_MAX_LEN` | `260` | BLE 数据包缓冲，`ATT_MTU = 值 - 4` → 256；`fidoControlPointLength = 253`。**必须容得下客户端的完整请求** |
 
 ### `SK_SIG_DER`：签名格式（重要）
 
@@ -239,6 +239,7 @@ PLATFORMIO_BUILD_FLAGS="-D SK_SIG_DER=0" pio run   # 规范 raw 模式
 | `fido2_server_test.py` | 用 `fido2` 的 `Fido2Server` 走**完整服务端验证** | 管理员 |
 | `fido2_ctaphid_test.py` | 底层 CTAPHID 命令（INIT / PING / WINK）与 GetInfo | 管理员 |
 | `hid_enum.py` | 枚举 HID 接口及 `usage_page`，判断是否被识别为 FIDO 设备 | 管理员 |
+| **`ble_gatt_client.py`** | **BLE FIDO GATT 客户端验证（脚本化，判定设备侧是否可用）** |
 | `raw_init.py` | 手工发一次 CTAPHID_INIT，打印原始字节 | 管理员 |
 
 ### 上电自测
@@ -308,11 +309,21 @@ passed 5/5
 - **不支持 Resident Key**：请求 `rk=true` 时返回 `0x2B`（如实拒绝，非静默忽略）
 - **不支持 `credentialManagement`**：该命令要求 PIN/UV，本实现无 PIN
 - **Attestation 为 `none`**：不提供 `packed` 等可验证的 attestation
-- **BLE 侧 CTAP 传输已实现，但客户端兼容性受限**：
-  设备侧的 GATT 服务、帧编解码、UP 挂起、配对均已验证（Windows 曾完整发起
-  `MakeCredential`），但 Android/Windows 客户端在服务发现后放弃。原因是经典
-  BLE GATT FIDO 本身的长期不可靠（OpenSK 以 USB 为主、Chrome 曾移除 BLE 支持、
-  业界已转向 caBLE）。详见 [BLE 侧实现规划](docs/BLE侧实现规划.md)
+- **BLE 侧 CTAP 传输：设备侧完整实现并验证，但客户端受平台限制**
+  - **设备侧已通过脚本化 GATT 客户端验证**（`tools/ble_gatt_client.py`，
+    基于 `bleak`）：特征发现、版本位读写、`CPLength`、订阅通知、`PING`、
+    `GetInfo` **六项全通**，且与 nRF Connect 手工测试结果一致
+  - **但 Windows（WebAuthn）与 Android 都无法完成经典 BLE FIDO 流程**：
+    前者读特征后放弃、后者更早退出，**均从不订阅通知、从不写请求**
+  - **根因在平台侧**（调研依据见下），**非本项目实现缺陷**：
+    - **Windows Hello** 对蓝牙安全密钥支持不完善（Mozilla Bug 1768622 实测
+      "只提示插入 USB"）
+    - **Android** 系统**显式限制**第三方访问 FIDO GATT 服务（`isFidoSrvcUuid`）
+    - **Chrome 自带的 BLE 认证器支持已于 2020 年移除**，业界转向 caBLE
+
+  **需要在真实客户端上验证时，建议走 Linux + `fido2ble`**
+  （把 BLE FIDO 桥接成 USB HID，绕开平台限制）。
+  详见 [BLE 侧实现规划](docs/BLE侧实现规划.md)
 - **`up=false` 的探测请求会直接放行**：不做用户确认（符合浏览器自动填充探测的需求）
 
 ### 待办
@@ -322,6 +333,7 @@ passed 5/5
       后可能失效。计划改为页内追加（擦除频率降约 64 倍）
 - [ ] 生产构建去掉 `-D DEBUG=1`
 - [ ] 跨平台验证（macOS / Linux / Edge / Firefox），注意 `SK_SIG_DER` 开关
+- [ ] **BLE 客户端验证**：需 Linux（`fido2ble`）或旧版 Android，绕开当前平台限制
 
 ### 需要注意的维护点
 

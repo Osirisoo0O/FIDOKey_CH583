@@ -501,18 +501,87 @@ auth: wait UP (15000 ms)                       ← 进入 UP 等待
 
 **因此这不是本实现特有的缺陷**，而是该技术方向的普遍困难。
 
-## 一个未采用的方向：BLE HID
+## 调研过的方向：BLE HID —— **已排除，不可行**
 
-**调研结论**：WCH 栈支持 HOGP（`HID_SERV_UUID = 0x1812`，SDK 自带 `HID_Keyboard` 等 4 个例程），且**报告描述符是应用层可自定义的普通数组**。
+**曾考虑的思路**：把已在 USB 侧跑通的 CTAPHID 协议搬到蓝牙 HID（HOGP）上——
+HID 报告 64 字节与 CTAPHID 帧长度正好一致，`ctaphid.c`/`ctap.c` 可原样复用。
 
-**思路**：把已在 USB 侧跑通的 **CTAPHID 协议**搬到蓝牙 HID 上——HID 报告 64 字节与 CTAPHID 帧长度**正好一致**，`ctaphid.c` 与 `ctap.c` 可原样复用，配对由 HID profile 的标准流程处理。
+**当时的可行性检查全部通过**：
 
-**未做的原因**：
-1. **非规范做法**——FIDO 规范定义的是 GATT 服务，不是 HID
-2. **前提未验证**——浏览器是否会通过 BLE HID 发现 FIDO 设备，没有把握
-3. **可能白做**——若客户端只按 GATT 服务筛选，HID 方案无效
+| 检查项 | 结果 |
+|---|---|
+| WCH 栈支持 HOGP | 是（`HID_SERV_UUID = 0x1812`，SDK 自带 4 个 HID 例程） |
+| 报告描述符可否自定义 | 可以（应用层普通数组） |
+| 报告长度能否 64 字节 | 可以 |
 
-**若将来要继续，这是首选方向**（复用度最高、绕开所有当前卡点）。
+**但进一步调研后确认这条路从规范上就不成立**：
+
+> **"CTAP2 over HID" refers specifically to USB HID, the wired transport — not Bluetooth.**
+> **CTAP2's Bluetooth transport uses BLE with a FIDO-specific GATT service (a restricted UUID), not HID/HOGP.**
+> **HOGP is a different, unrelated Bluetooth profile.**
+
+**FIDO 规范里 CTAP2 只有三种传输**：**USB HID**、**NFC**、**BLE + FIDO GATT 服务**。
+**蓝牙 HID（HOGP）从来不是 FIDO 的传输方式**，客户端也不会通过它去发现认证器。
+
+**旁证**：`webauthn-authenticator-rs` 的后端列表是
+`usb` / `bluetooth`（btleplug，即 GATT）/ `nfc` / `cable` —— **没有 HID**。
+
+**结论**：本项目的 GATT 实现（`0xFFFD` + 4 个特征）**就是规范要求的做法，也是唯一可行的做法**。
+BLE HID 方向**不应实现**。
+
+> ⚠️ 这一节曾把 BLE HID 标为"若不继续调 GATT 则首选的方向"——
+> 那是在只验证了"技术可行性"、未验证"客户端是否认"的情况下做出的判断，**现已纠正**。
+
+---
+
+## 客户端兼容性的根因（调研补充）
+
+设备侧实现正确，但两个平台的接入均受阻。**调研发现这两者都有明确的外部原因**：
+
+### Android：系统层面的显式限制
+
+> **Android restricts access to FIDO-related BLE GATT service UUIDs (via `isFidoSrvcUuid`),
+> which blocks third-party apps from managing BLE security keys.**
+
+**即：Android 系统主动限制了第三方对 FIDO GATT 服务的访问。** 这解释了为什么设备能被扫描到、
+能配对，却在 Play Services 那一步卡住（"按住按键 5 秒"提示后无后续）。
+
+### Windows：Windows Hello 对蓝牙密钥支持不完善
+
+Mozilla 工程师的实测记录：
+
+> **"As far as I can tell Windows Hello does not support Bluetooth security keys
+> (when I try to add a security key it asks to insert it in the USB port)."**
+> — Bugzilla 1768622
+
+以及 FIDO Dev 邮件列表（2025-07）的报告：**Windows 11 的 BLE 密钥管理
+（设置 → 账户 → 登录选项 → 安全密钥 → 管理）出现过回归并崩溃**，微软方面已确认该回归。
+
+### 行业现状
+
+- **Chrome 的 BLE 认证器支持在 2020 年前后被移除**（Mac / ChromeOS）；
+  其他平台交给系统 API。Chrome 官方工程师范畴内的表述是"**decided not to ship**"
+- **OpenSK**（Google 的 FIDO2 实现）**以 USB HID 为主**，BLE 需要额外挂一个服务
+- 业界已转向 **caBLE / hybrid transport**（二维码 + BLE 接近，密码学载荷走加密隧道）
+- 社区共识：经典 CTAP over BLE "**quite unreliable and has a poor user experience**"
+
+**因此本项目遇到的不是实现缺陷，而是该技术方向在主流平台上"规范有、实现弱"的整体状态。**
+
+---
+
+## 可行的验证途径（若将来有条件）
+
+| 途径 | 说明 |
+|---|---|
+| **Linux + `fido2ble`** | 用 [PoneBiometrics/fido2ble](https://github.com/PoneBiometrics/fido2ble) 把 BLE FIDO 设备桥接成 USB HID——**绕过 Windows/Android 的平台限制，最干净** |
+| **旧版 Android（8~10）** | 在系统限制收紧之前可能可用 |
+| **FIDO Conformance Tool** | 按规范测试，不依赖操作系统 |
+| **Android + 系统级 FIDO 管理界面** | 而非浏览器发起 |
+
+> `fido2ble` 的实现已核对：它使用的 **UUID（4 个，无 `0x2A28`）、命令码、
+> 分片逻辑与本项目完全一致**——这从另一个角度印证了设备侧实现的正确性。
+
+---
 
 ## 保留的配置
 
@@ -522,3 +591,140 @@ auth: wait UP (15000 ms)                       ← 进入 UP 等待
 ```
 
 **临时诊断均已清理**（`BLE_TRANSPORT_DUMP`、`BLE_ERASE_BONDS_ON_BOOT` 及各处 `PRINT`）。
+
+---
+
+# 调试过程与最终结论（2026-02 续）
+
+> 本节记录"让浏览器真正用起来"这一阶段的完整调试。结论是：
+> **设备侧完整且正确，两个主流平台的客户端都无法完成经典 BLE FIDO 流程。**
+
+## 一、决定性验证：脚本化 GATT 客户端
+
+浏览器路径反复失败后，改用 **`tools/ble_gatt_client.py`**（基于 `bleak`）——
+**直接作为标准 GATT 客户端**按 CTAP 2.1 §11.4.6 的规范流程操作设备，
+**绕开浏览器/系统的 FIDO 集成层**。
+
+### 结果：六项全部通过
+
+```
+[1] 特征发现        ✓ fidoControlPoint(write) fidoStatus(notify)
+                      fidoControlPointLength(read) fidoServiceRevisionBitfield(read,write)
+[2] 版本位          ✓ 读 0x20 -> 写 0x20 -> 回读 0x20
+[3] CPLength        ✓ 253（FD 00）
+[4] 订阅通知        ✓
+[5] PING            ✓ 回显正确
+[6] GetInfo         ✓ CTAP 状态成功，CBOR 完整（含 FIDO_2_0 声明）
+```
+
+**这一步的意义**：**同一固件、同一个 Windows 系统**，
+
+| 路径 | 结果 |
+|---|---|
+| **`bleak` → winrt → Windows BLE 栈** | **✅ 六步全通** |
+| **浏览器 → Windows WebAuthn（Windows Hello）→ BLE** | **❌ 读特征后放弃** |
+
+**所以 BLE 适配层没有问题，问题在 WebAuthn 层。**
+
+**其中 [2] 是首次验证**：此前没有任何客户端写过 `fidoServiceRevisionBitfield`，
+设备日志确认写入路径正常（`[FIDO] write h=0x0028 len=1 method=0x12`）。
+
+## 二、两个平台的实测行为
+
+### Windows（PC 网页）
+
+```
+新配对时  -> 读 fidoControlPointLength -> 读 fidoServiceRevisionBitfield -> 停止
+已绑定时  -> 什么都不读（连特征都不访问）
+```
+
+**从不订阅通知、从不写请求。** 与 Mozilla 工程师的实测记录一致：
+
+> **"As far as I can tell Windows Hello does not support Bluetooth security keys
+> (when I try to add a security key it asks to insert it in the USB port)."**
+> — Bugzilla 1768622
+
+**Windows 能识别 BLE 认证器，但没有能力完成完整交互。**
+
+### Android
+
+```
+读 fidoControlPointLength -> 停止
+```
+
+**比 Windows 更早退出，且从不读版本位。**
+
+**结论**：经典 CTAP over BLE 在桌面/移动端都处于"规范有、实现弱"的状态 ——
+Chrome 自带实现已于 2020 年移除、OpenSK 以 USB 为主、业界转向 caBLE。
+**这是平台侧的限制，不是本项目的实现缺陷。**
+
+## 三、这个阶段修掉的真实缺陷
+
+**虽然它们都不是平台受阻的原因，但每一个都是真问题：**
+
+| # | 缺陷 | 症状 | 修复 |
+|---|---|---|---|
+| 1 | **`peripheralMTU` 声明为 `uint8_t`** | MTU > 255 时溢出为 0，`ble_transport_set_mtu()` 直接返回 | 改为 **`uint16_t`** |
+| 2 | **`fidoControlPointLength` 停留在初始值 20** | 上面第 1 条的直接后果（23-3） | 随上条修复，现返回 **253** |
+| 3 | **ATT_MTU 仅 96（CPLength 93）** | 装不下 `MakeCredential` 请求（100~200 字节） | `BLE_BUFF_MAX_LEN` 100 → **260**（MTU 256）|
+| 4 | **配对成功即退出配对模式** | 广播的 Service Data bit7 立刻清零，客户端认为设备不可用 | **只在窗口超时/重启时退出** |
+| 5 | **缺少 Service Data 配对模式标志** | 规范 §11.4.7 明确要求（平台不读 AD Flags 的 Discoverable 位）| 在**扫描响应**中加入 `16 FD FF <flags>` |
+| 6 | **配对级别超出设备能力** | 声称 Security Mode 1 Level 3（`mitm=TRUE`）却无 `passcodeCB` | 降为 **Level 2**（`mitm=FALSE` + `NO_INPUT_NO_OUTPUT`）|
+| 7 | **连接监督超时仅 6 秒** | 调试/交互时频繁断连 | 600 → **3000**（30 秒）|
+| 8 | **连接间隔上限 250ms** | 每次特征读写要等一个连接事件，累积成数秒 | 200 → **24**（30ms）|
+| 9 | **128-bit 属性读取未设 `*pLen`** | 读 `fidoControlPoint`/`fidoStatus` 会拿到未初始化的长度 | 明确返回 `ATT_ERR_READ_NOT_PERMITTED` |
+| 10 | **多余的 GATT 服务** | 保留 WCH 示例的 `SimpleProfile` 与已废弃的 `ble_usb_service` | **移除**（规范只要求 GAP + DIS + FIDO）|
+| 11 | **DIS 值是占位文本** | 字面就是 `"Model Number"` 等 | 改为真实值（`CH583-FIDO2` / `1.0.0` / `SecureKey`）|
+
+### 调试中排除的假设
+
+| 假设 | 依据 | 结果 |
+|---|---|---|
+| 配对模式标志（Service Data）| 客户端在配对后立刻停止 | 改善但非根因 |
+| 连接参数太慢 | `Update 1 - Int c0`（240ms）| **否** |
+| CPLength 值太小 | 客户端读完它就停 | **否**（253 仍停）|
+| 特征在属性表中的顺序 | 客户端按 handle 遍历 | **否** |
+| 绑定记录不一致 | `reason=0x3D`（MIC Failure）| 新配对后改善，但仍停 |
+
+## 四、`tools/ble_gatt_client.py`
+
+**保留为验证工具**（不属于固件构建）。用途：
+
+```bash
+pip install bleak
+# 长按 PB4 满 5 秒进入配对模式，然后：
+python tools/ble_gatt_client.py --scan   # 只扫描，看广播与 Service Data
+python tools/ble_gatt_client.py          # 完整流程（[1]~[8]）
+```
+
+**它能做的事**：
+
+- **按规范顺序验证 4 个特征**（UUID、属性）
+- **验证版本位读写**
+- **验证订阅通知 + PING + GetInfo**
+- **验证 MakeCredential / GetAssertion**（需按住 PB4 提供 UP）
+- **分片收发与设备侧实现对齐**（初始帧 `MTU-3`、续帧 `MTU-4`）
+
+**它是本项目"设备侧是否可用"的判定工具** —— 当浏览器表现异常时，
+先用它排除设备侧。
+
+## 五、最终状态
+
+**设备侧（BLE 传输层）**：
+
+- **GATT 服务、帧编解码、分片收发、UP 挂起、KEEPALIVE、CANCEL** —— 全部实现并验证
+- **CTAP2 逻辑层与 USB 侧共用**（`ctap.c` 未改动）
+- **nRF Connect 手工测试 + `bleak` 脚本测试均通过**
+
+**客户端侧**：
+
+- **Windows（WebAuthn）与 Android 都无法完成经典 BLE FIDO 流程**
+- **原因在平台，非实现**（调研依据见本文档前文"客户端兼容性的根因"）
+
+**后续若要在真实客户端上验证**，可行路径仍是：
+
+| 途径 | 说明 |
+|---|---|
+| **Linux + `fido2ble`** | 把 BLE FIDO 桥接成 USB HID，绕开平台限制 |
+| **FIDO Conformance Tool** | 按规范测试，不依赖操作系统 |
+| **继续用 `ble_gatt_client.py`** | 设备侧回归测试 |
