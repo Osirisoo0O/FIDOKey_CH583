@@ -50,7 +50,14 @@ def first_assertion(sel):
 def verify_assertion_signature(cose_key, auth_data, client_data_hash, signature):
     """用注册时的公钥验证登录签名（离线、独立于设备）。
 
-    返回 (ok, detail)。签名格式为 WebAuthn 的 raw r||s（64 字节，非 DER）。
+    返回 (ok, detail)。
+
+    签名格式自动识别：
+      - 64 字节       -> CTAP2 规范的 raw r||s，需转成 ASN.1 DER 再验证
+      - 0x30 开头     -> 已是 ASN.1 DER（本固件当前用 SK_SIG_DER=1，输出 DER）
+
+    固件的开关见 src/ctap.c 的 SK_SIG_DER：DER 格式下浏览器可用，
+    但 fido2 库会再转一次 DER，所以下面必须区分处理。
     """
     try:
         import hashlib
@@ -74,15 +81,22 @@ def verify_assertion_signature(cose_key, auth_data, client_data_hash, signature)
         msg = bytes(auth_data) + client_data_hash
         digest = hashlib.sha256(msg).digest()
 
-        if len(signature) != 64:
-            return False, "签名长度 %d，期望 64" % len(signature)
-        r = int.from_bytes(signature[:32], "big")
-        s = int.from_bytes(signature[32:], "big")
-        der = utils.encode_dss_signature(r, s)
+        # 自动识别签名格式
+        if len(signature) == 64:
+            sig_kind = "raw r||s"
+            r = int.from_bytes(signature[:32], "big")
+            ss = int.from_bytes(signature[32:], "big")
+            der = utils.encode_dss_signature(r, ss)
+        elif len(signature) >= 2 and signature[0] == 0x30:
+            sig_kind = "ASN.1 DER"
+            der = signature
+        else:
+            return None, "无法识别的签名格式（长度 %d，首字节 0x%02X）" % (
+                len(signature), signature[0] if signature else 0)
 
         try:
             pub.verify(der, digest, ec.ECDSA(utils.Prehashed(hashes.SHA256())))
-            return True, "签名验证通过"
+            return True, "签名验证通过（输入 %s）" % sig_kind
         except InvalidSignature:
             return False, "签名验证失败（InvalidSignature）"
     except Exception as e:

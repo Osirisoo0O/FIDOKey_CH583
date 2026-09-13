@@ -170,7 +170,10 @@ def main():
     print("  fido2 算出的 hash       :", ccd.hash.hex()[:32], "...")
     print("  两者一致                :", ccd.hash == cdh2)
     print("  authData 长度           :", len(bytes(a.auth_data)))
-    print("  signature 长度          :", len(bytes(a.signature)))
+    _siglen = len(bytes(a.signature))
+    _sigkind = "raw r||s" if _siglen == 64 else (
+        "ASN.1 DER" if bytes(a.signature)[:1] == b"0" else "未知")
+    print("  signature 长度          :", _siglen, "(%s)" % _sigkind)
     print("  设备返回的 userHandle   :", user_handle)
     print("  authData[32] (flags)    :", hex(bytes(a.auth_data)[32]))
     print("  authData[33:37] (count) :", bytes(a.auth_data)[33:37].hex())
@@ -182,9 +185,14 @@ def main():
             int.from_bytes(x, "big"), int.from_bytes(y, "big"),
             ec.SECP256R1()).public_key()
         digest = __import__("hashlib").sha256(bytes(a.auth_data) + cdh2).digest()
-        r = int.from_bytes(bytes(a.signature)[:32], "big")
-        ss = int.from_bytes(bytes(a.signature)[32:], "big")
-        der = cu.encode_dss_signature(r, ss)
+        sig = bytes(a.signature)
+        if len(sig) == 64:
+            der = cu.encode_dss_signature(
+                int.from_bytes(sig[:32], "big"), int.from_bytes(sig[32:], "big"))
+        elif sig[:1] == b"0":
+            der = sig                       # 已是 DER
+        else:
+            raise ValueError("无法识别的签名格式：长度 %d" % len(sig))
         pub.verify(der, digest, ec.ECDSA(cu.Prehashed(ch.SHA256())))
         print("  手工验证(Prehashed)     : 通过")
     except ISig:
@@ -202,8 +210,9 @@ def main():
     print("---- 对比结束 ----")
     print()
 
-    # CTAP2 设备返回的是 raw r||s（64 字节）；WebAuthn/服务端期望 ASN.1 DER。
-    # 这个转换在真实链路由 Windows/Chrome 完成，这里必须手工做。
+    # 服务端期望 ASN.1 DER。本固件当前用 SK_SIG_DER=1 直接输出 DER，
+    # 此时原样传递即可；若切回 SK_SIG_DER=0（规范 raw），则需在这里手工转换。
+    # （真实浏览器的表现见《详细软件开发计划》5.2.3：本平台上主机不做转换。）
     from cryptography.hazmat.primitives.asymmetric import utils as _cu
     _sig = bytes(a.signature)
     if len(_sig) == 64:
