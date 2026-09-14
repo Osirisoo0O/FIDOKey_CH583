@@ -319,6 +319,26 @@ bStatus_t fido_status_notify(uint16_t connHandle, const uint8_t *p_data, uint16_
  * LOCAL FUNCTIONS
  */
 
+/* 把 ATT 方法码转成可读名 —— 排查"客户端连上但不发 CTAP 命令"时，
+ * 日志里 method 的可读名称比裸十六进制直观得多。
+ * （宏名见 BLE_LIB/CH58xBLE_LIB.h 的 ATT_* 定义。） */
+static const char *fido_AttMethodName(uint8_t method)
+{
+    switch(method)
+    {
+        case ATT_ERROR_RSP:            return "ERROR_RSP";
+        case ATT_FIND_INFO_REQ:        return "FIND_INFO_REQ";
+        case ATT_READ_BY_TYPE_REQ:     return "READ_BY_TYPE_REQ(特征发现)";
+        case ATT_READ_REQ:             return "READ_REQ(读值)";
+        case ATT_READ_BLOB_REQ:        return "READ_BLOB_REQ";
+        case ATT_READ_BY_GRP_TYPE_REQ: return "READ_BY_GRP_TYPE_REQ(服务发现)";
+        case ATT_WRITE_REQ:            return "WRITE_REQ";
+        case ATT_WRITE_CMD:            return "WRITE_CMD";
+        case ATT_HANDLE_VALUE_CFM:     return "HANDLE_VALUE_CFM";
+        default:                       return "?";
+    }
+}
+
 static bStatus_t fido_ReadAttrCB(uint16_t connHandle, gattAttribute_t *pAttr,
                                  uint8_t *pValue, uint16_t *pLen,
                                  uint16_t offset, uint16_t maxLen, uint8_t method)
@@ -327,12 +347,17 @@ static bStatus_t fido_ReadAttrCB(uint16_t connHandle, gattAttribute_t *pAttr,
 
     /* method 能区分客户端用的是哪种 ATT 操作：
      *   0x0A READ_REQ              普通读单值
-     *   0x08 READ_BY_TYPE_REQ      按类型读（服务发现）
+     *   0x08 READ_BY_TYPE_REQ      按类型读（特征发现）
      *   0x0C READ_BLOB_REQ         长读（值超过 MTU-1 时分段）
      *   0x10 READ_BY_GROUP_TYPE    按组读（发现主服务，通常不进本回调）
      *   0x04 FIND_INFO_REQ         发现描述符
-     * 客户端走到哪一步，从这里的 method 序列就能看出来。 */
-    PRINT("[FIDO] read  h=0x%04X method=0x%02X", pAttr->handle, method);
+     * 客户端走到哪一步，从这里的 method 序列就能看出来。
+     *
+     * 用于排查"客户端连上但不发 CTAP 命令"：若日志里始终只有
+     * READ_REQ（读值）而从不出现 READ_BY_TYPE_REQ（特征发现），
+     * 说明客户端没走标准的 GATT 发现流程。 */
+    PRINT("[FIDO] read  h=0x%04X method=0x%02X (%s)",
+          pAttr->handle, method, fido_AttMethodName(method));
     PRINT("%c", 10);
 
     if(gattPermitAuthorRead(pAttr->permissions))

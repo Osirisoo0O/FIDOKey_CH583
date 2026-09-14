@@ -69,8 +69,17 @@
  *       进入后 LED 快闪（可见提示），30 秒内无配对则自动退出。
  *       同时在广播的 Service Data 里置 bit7（客户端主要靠它判断）。
  * ------------------------------------------------------------------------- */
-#define PAIRING_HOLD_MS         5000    /* 长按满 5 秒进入配对模式 */
+#if defined(DEBUG) && DEBUG
+/* 调试构建（-D DEBUG=1，platformio.ini 的默认环境即是）：200ms 即进入配对模式。
+ * 排查阶段要反复"进配对模式 -> 在客户端操作 -> 重来"，每次都按满 5 秒会明显
+ * 拖慢节奏。200ms 仍不容许"无意间碰到"，但按下去就能进。
+ * 正式构建走下面的 5000。 */
+#define PAIRING_HOLD_MS         200
+#else
+#define PAIRING_HOLD_MS         5000    /* 长按满 5 秒进入配对模式（防误触发）*/
+#endif
 #define PAIRING_SAMPLE_MS       50      /* 按键采样间隔（节流） */
+
 #define PAIRING_WINDOW_MS       120000  /* 配对模式持续 120 秒（初次进入后）*/
 /* 说明：窗口原本 30 秒，实测太短 —— 从长按到客户端完成"扫描->连接->配对
  * ->特征发现"很容易超过 30 秒，一旦窗口在交互中途过期，客户端会认为
@@ -133,94 +142,82 @@
  */
 static uint8_t Peripheral_TaskID = INVALID_TASK_ID; // Task ID for internal task/event processing
 
-// GAP - SCAN RSP data (max size = 31 bytes)
+// GAP - 扫描响应数据（最大 31 字节）
 //
-// 设备名从 "Simple Peripheral" 缩短为 "SecureKey"：腾出 8 字节给下面的
-// FIDO Service Data 字段（Service Data 是规范强烈建议的，见其说明）。
+// 这里只放"设备名 + 连接间隔期望 + 发射功率"。
+// 设备名从 WCH 默认的 "Simple Peripheral" 缩短为 "SecureKey"。
+//
+// 注：FIDO 的 Service Data **不在这里**，它在 advertData 里
+//     （那样客户端在主动扫描时就能一并拿到，见 advertData 的说明）。
 static uint8_t scanRspData[] = {
-    // complete name
+    // 完整设备名（9 字符）—— 客户端扫描结果里显示的就是它
     0x0A, // length: 1(type) + 9(name)
     GAP_ADTYPE_LOCAL_NAME_COMPLETE,
     'S', 'e', 'c', 'u', 'r', 'e', 'K', 'e', 'y',
 
-    /* FIDO Service Data —— CTAP 2.1 规范 §11.4.7 "Authenticator Advertising
-     * Format" 的要求：
-     *
-     *   "Some client platforms (most notably iOS) do not expose the AD Flag
-     *    LE Limited and General Discoverable Mode bits to applications. For
-     *    this reason, authenticators are also strongly RECOMMENDED to include
-     *    the Service Data field in the Scan Response.
-     *    The first 2 bytes contain the FIDO Service UUID, the following bytes
-     *    are flag bytes."
-     *
-     *   bit7 = Device is in pairing mode
-     *   bit6 = Device requires Passkey Entry
-     *
-     * 为什么必须有：客户端的"请按住按键 5 秒"提示就是这个判断的产物 ——
-     * 它读不到"设备处于配对模式"的信号就不肯继续（表现为配对成功后
-     * 停在原地，一步 GATT 操作都不做）。
-     */
+    // 期望的连接间隔范围
+    0x05, // length of this data
+    GAP_ADTYPE_SLAVE_CONN_INTERVAL_RANGE,
+    LO_UINT16(DEFAULT_DESIRED_MIN_CONN_INTERVAL),
+    HI_UINT16(DEFAULT_DESIRED_MIN_CONN_INTERVAL),
+    LO_UINT16(DEFAULT_DESIRED_MAX_CONN_INTERVAL),
+    HI_UINT16(DEFAULT_DESIRED_MAX_CONN_INTERVAL),
+
+    // 发射功率
+    0x02, // length of this data
+    GAP_ADTYPE_POWER_LEVEL,
+    0 // 0dBm
+};
+/* scanRspData 合计 11 + 6 + 3 = 20 字节，未超过 B_MAX_ADV_LEN(31)。 */
+
+// GAP - 主广播数据（最大 31 字节；为省电应尽量短）
+static uint8_t advertData[] = {
+    // AD Flags —— 其值由 Peripheral_SetPairingMode() 动态改写（见下）。
+    // 注意与 WCH 默认注释的差别：本设备**不**使用 limited discoverable
+    // （那只广播 30 秒）。配对模式的切换靠 Service Data 的 bit7 表达 ——
+    // 平台通常不向应用暴露 AD Flags 的 Discoverable 位。
+    0x02, // length of this data
+    GAP_ADTYPE_FLAGS,
+    DEFAULT_DISCOVERABLE_MODE | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED,
+
+    // ---- FIDO 服务 UUID（128-bit）----
+    // 客户端靠广播里的服务 UUID 筛选目标设备，所以必须放在**主广播**里
+    // （若只放扫描响应，部分客户端不主动扫响应就看不到它）。
+    // 0000fffd-0000-1000-8000-00805f9b34fb，16 字节**整体反序**存放
+    // （WCH 栈不用 BLE 规范的分段反序，见 fido_service.c 的说明）。
+    0x11,                      // length: 1(type) + 16(uuid)
+    GAP_ADTYPE_128BIT_COMPLETE,
+    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
+    0x00, 0x10, 0x00, 0x00, 0xfd, 0xff, 0x00, 0x00,
+
+    // ---- FIDO Service Data（配对模式标志）----
+    // CTAP 2.1 规范 §11.4.7 "Authenticator Advertising Format"：
+    //   "Some client platforms (most notably iOS) do not expose the AD Flag
+    //    LE Limited and General Discoverable Mode bits to applications. For
+    //    this reason, authenticators are also strongly RECOMMENDED to include
+    //    the Service Data field in the Scan Response.
+    //    The first 2 bytes contain the FIDO Service UUID, the following bytes
+    //    are flag bytes."
+    //
+    //   bit7 = Device is in pairing mode     ← 本设备用这一位
+    //   bit6 = Device requires Passkey Entry
+    //
+    // 为什么必须有：客户端的"请按住按键 5 秒"提示就是这个判断的产物 ——
+    // 读不到"设备处于配对模式"的信号它就不肯继续（表现为配对成功后停在
+    // 原地，一步 GATT 操作都不做）。
+    // 该标志字节的位置由 ADVERT_SD_FLAGS_OFFSET 指定，并在
+    // Peripheral_SetPairingMode() 里随配对模式开关改写。
     0x04,                                  // length: 1(type) + 2(uuid) + 1(flags)
     GAP_ADTYPE_SERVICE_DATA,               // 0x16
     LO_UINT16(FIDO_SERVICE_UUID16),
     HI_UINT16(FIDO_SERVICE_UUID16),
     FIDO_SERVICE_DATA_FLAGS,
-
-    // connection interval range
-    0x05, // length of this data
-    GAP_ADTYPE_SLAVE_CONN_INTERVAL_RANGE,
-    LO_UINT16(DEFAULT_DESIRED_MIN_CONN_INTERVAL), // 100ms
-    HI_UINT16(DEFAULT_DESIRED_MIN_CONN_INTERVAL),
-    LO_UINT16(DEFAULT_DESIRED_MAX_CONN_INTERVAL), // 1s
-    HI_UINT16(DEFAULT_DESIRED_MAX_CONN_INTERVAL),
-
-    // Tx power level
-    0x02, // length of this data
-    GAP_ADTYPE_POWER_LEVEL,
-    0 // 0dBm
 };
-
-// GAP - Advertisement data (max size = 31 bytes, though this is
-// best kept short to conserve power while advertising)
-static uint8_t advertData[] = {
-    // Flags; this sets the device to use limited discoverable
-    // mode (advertises for 30 seconds at a time) instead of general
-    // discoverable mode (advertises indefinitely)
-    0x02, // length of this data
-    GAP_ADTYPE_FLAGS,
-    DEFAULT_DISCOVERABLE_MODE | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED,
-
-    // FIDO 服务（128-bit UUID）：客户端靠广播里的服务 UUID 筛选目标设备，
-    // 因此必须放在广播包（而不能只放在扫描响应）里。
-    // 0000fffd-0000-1000-8000-00805f9b34fb，16 字节整体反序存放
-    // （WCH 栈不采用 BLE 规范的分段反序；详见 fido_service.c 的说明）
-    0x11,                      // length: 1(type) + 16(uuid)
-    GAP_ADTYPE_128BIT_COMPLETE,
-    0xfb, 
-    0x34, 
-    0x9b,
-    0x5f, 
-    0x80,
-    0x00, 
-
-    0x00,
-    0x80, 
-    
-    0x00, 
-    0x10, 
-    
-    0x00, 0x00, 
-    0xfd, 
-    0xff,
-    0x00, 0x00,     
-
-    // 说明：原先这里还有 WCH 示例服务的 16-bit UUID（SimpleProfile），
-    // 作为"蓝牙连接本身是否正常"的参照物保留。FIDO 服务已跑通且广播空间
-    // 紧张（Service Data 要占位置），故移除。
-};
-
-/* 说明：advertData 3 + 18 = 21 字节，scanRspData 11 + 5 + 6 + 3 = 25 字节，
- * 均未超过 B_MAX_ADV_LEN(31)。 */
+/* advertData 合计 3 + 18 + 5 = 26 字节，未超过 B_MAX_ADV_LEN(31)。
+ *
+ * 说明：原先这里还有 WCH 示例服务的 16-bit UUID（SimpleProfile），作为
+ * "蓝牙连接本身是否正常"的参照物保留；FIDO 服务已跑通且广播空间紧张，
+ * 故已移除。 */
 
 /* ---- FIDO 配对模式状态 ---- */
 static uint8_t  s_pairing_mode  = 0;    /* 0=非配对模式, 1=配对模式 */
@@ -228,17 +225,27 @@ static uint32_t s_pairing_deadline = 0;
 static uint32_t s_key_sample    = 0;    /* 长按检测的上次采样时刻 */
 static uint32_t s_key_hold_start = 0;   /* 按住起点；0 = 未按住 */
 
-/* 广播数据里的固定偏移（改动广播内容时必须同步更新这里）：
- *   advertData[2]     = AD Flags 字节（GAP_ADTYPE_FLAGS 的值所在处）
- *   scanRspData[12]   = Service Data 里 FIDO 标志字节
- *                       0x0A, NAME(9)  →  11 字节
- *                       0x04, 0x16, FD, FF, FLAGS  →  flags 在第 11+4 = 15 处
- * 为避免手算出错，这里用宏并在 set 时断言（见 Peripheral_SetPairingMode）。 */
+/* advertData 里两个"会被 Peripheral_SetPairingMode() 动态改写"的字节偏移。
+ * 改动 advertData 的内容或顺序时，必须同步核对这两个值：
+ *
+ *   advertData[0..2]   0x02, GAP_ADTYPE_FLAGS, <flags>
+ *                      -> AD Flags 在 [2]
+ *   advertData[3..20]  0x11, GAP_ADTYPE_128BIT_COMPLETE, <16 字节 FIDO UUID>
+ *   advertData[21..25] 0x04, GAP_ADTYPE_SERVICE_DATA,
+ *                      LO(FIDO_SERVICE_UUID16), HI(FIDO_SERVICE_UUID16), <flags>
+ *                      -> Service Data 的配对模式标志在 [25]
+ */
 #define ADVERT_FLAGS_OFFSET     2
-#define SCANRSP_SD_FLAGS_OFFSET 15
+#define ADVERT_SD_FLAGS_OFFSET  25
 
-// GAP GATT Attributes
-static uint8_t attDeviceName[GAP_DEVICE_NAME_LEN] = "Simple Peripheral";
+// GAP GATT Attributes —— 设备名（GAP 服务的 0x2A00 特征）
+//
+// 必须与广播里 scanRspData 的名字**一致**，否则会出现这种问题：
+// Windows 的 WebAuthn 从 GAP 服务读名字、把它存进配对记录
+// （事件日志里显示 PairedName: Simple Peripheral），而广播里报的是
+// SecureKey —— 两侧名称不同会让客户端把该配对记录与广播设备视为
+// 不同对象，进而在服务查找时报 NTE_NOT_FOUND (0x80090011)。
+static uint8_t attDeviceName[GAP_DEVICE_NAME_LEN] = "SecureKey";
 
 // Connection item list
 static peripheralConnItem_t peripheralConnList;
@@ -295,9 +302,9 @@ static void Peripheral_SetPairingMode(uint8_t on)
     /* 1) Service Data 里的 FIDO 标志字节：bit7 = 处于配对模式。
      *    这是客户端（iOS/Android）判断设备能否配对的主要依据 ——
      *    规范指出平台通常不向应用暴露 AD Flags 的 Discoverable 位。 */
-    scanRspData[SCANRSP_SD_FLAGS_OFFSET] =
+    advertData[ADVERT_SD_FLAGS_OFFSET] =
         on ? FIDO_SD_BIT_PAIRING_MODE : 0x00;
-    GAPRole_SetParameter(GAPROLE_SCAN_RSP_DATA, sizeof(scanRspData), scanRspData);
+    GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(advertData), advertData);
 
     /* 2) AD Flags（规范 §11.4.7）：
      *      配对模式   -> General Discoverable = 1
@@ -349,6 +356,20 @@ void Peripheral_PairingModePoll(void)
     }
     s_key_sample = now;
 
+    /* 诊断：按键状态变化时打印一次（不刷屏）。
+     *   按下 -> 报一次起点；按住满 5 秒 -> 报一次；
+     *   若一直只看到 down/up 而没有 held 满，说明是"没按住"或采样被饿死。 */
+    {
+        static uint8_t s_last_btn = 0;
+        uint8_t btn = HAL_PUSH_BUTTON2() ? 1 : 0;
+        if(btn != s_last_btn)
+        {
+            s_last_btn = btn;
+            PRINT("[KEY] %s (auth_sm=%u)", btn ? "down" : "up", auth_sm_get());
+            PRINT("%c", 10);
+        }
+    }
+
     if(HAL_PUSH_BUTTON2())
     {
         if(s_key_hold_start == 0)
@@ -363,6 +384,18 @@ void Peripheral_PairingModePoll(void)
             if((now - s_key_hold_start) >= PAIRING_HOLD_MS)
             {
                 Peripheral_SetPairingMode(1);
+            }
+        }
+        else
+        {
+            /* 诊断：长按被这两个条件之一挡住了（每 1 秒提示一次，不刷屏） */
+            static uint32_t s_last_hint = 0;
+            if((now - s_last_hint) >= 1000)
+            {
+                s_last_hint = now;
+                PRINT("[KEY] held but blocked: pairing=%u auth_sm=%u",
+                      s_pairing_mode, auth_sm_get());
+                PRINT("%c", 10);
             }
         }
     }
@@ -448,8 +481,7 @@ void Peripheral_Init()
          * 用户需长按 5 秒才进入配对模式（规范要求进入动作"不易误触发"）。
          * 这里先按非配对模式改写广播数据，随后由协议栈启用广播。 */
         advertData[ADVERT_FLAGS_OFFSET] = GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED;
-        scanRspData[SCANRSP_SD_FLAGS_OFFSET] = 0x00;
-        GAPRole_SetParameter(GAPROLE_SCAN_RSP_DATA, sizeof(scanRspData), scanRspData);
+        advertData[ADVERT_SD_FLAGS_OFFSET] = 0x00;
         GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(advertData), advertData);
         GAPRole_SetParameter(GAPROLE_MIN_CONN_INTERVAL, sizeof(uint16_t), &desired_min_interval);
         GAPRole_SetParameter(GAPROLE_MAX_CONN_INTERVAL, sizeof(uint16_t), &desired_max_interval);
@@ -469,6 +501,19 @@ void Peripheral_Init()
         GAP_SetParamValue(TGAP_ADV_SCAN_REQ_NOTIFY, ENABLE);
     }
 
+
+#if defined(BLE_ERASE_BONDS_ON_BOOT)
+    /* 临时调试开关（-D BLE_ERASE_BONDS_ON_BOOT 打开）：每次上电清除所有绑定。
+     *
+     * 为什么需要：绑定记录持久化在 SNV Flash 里，光重启设备不会清掉。
+     * 两侧绑定不一致时（换过配对参数、或客户端保留了旧 LTK），加密阶段会
+     * 以 MIC Failure（断开原因 0x3D）失败 —— 表现为连上就断、不发任何
+     * FIDO 请求，很难与代码问题区分。
+     *
+     * 清完 SNV 后应当**移除本开关再配对**，否则下次上电又清一次。 */
+    GAPBondMgr_SetParameter(GAPBOND_ERASE_ALLBONDS, 0, NULL);
+    PRINT("[BLE] bonds erased on boot (debug)%c", 10);
+#endif
 
     // Setup the GAP Bond Manager
     //

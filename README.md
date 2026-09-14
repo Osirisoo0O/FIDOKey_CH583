@@ -2,9 +2,9 @@
 
 基于 **WCH CH583**（RISC-V 青稞 V4，RV32IMAC）实现的 **FIDO2 / WebAuthn 安全密钥**。
 
-设备通过 USB HID 提供标准 CTAP2 能力，可在浏览器中完成注册与登录；同时保留 BLE 外设功能
-（BLE 侧 CTAP 传输尚未实现）。内置 P-256 密钥生成与签名、用户在场确认（按键 + LED 提示）、
-加密的凭证存储。
+设备通过 **USB HID** 提供标准 CTAP2 能力，可在浏览器中完成注册与登录；**BLE 侧也实现了
+完整的 CTAP2 GATT 传输**（设备侧已通过脚本化客户端逐项验证，见下文"BLE 侧"一节）。
+内置 P-256 密钥生成与签名、用户在场确认（按键 + LED 提示）、加密的凭证存储。
 
 ---
 
@@ -206,6 +206,7 @@ python tools/fido2_server_test.py    # 完整服务端验证（最接近真实�
 | `CTAPHID_DUMP` | 未定义 | 打印 CTAP 请求/响应全文，**排障用，会阻塞串口** |
 | `SK_SIG_DER` | `1` | 签名输出格式，见下 |
 | `BLE_BUFF_MAX_LEN` | `260` | BLE 数据包缓冲，`ATT_MTU = 值 - 4` → 256；`fidoControlPointLength = 253`。**必须容得下客户端的完整请求** |
+| `PAIRING_HOLD_MS` | 随 `DEBUG` 变 | **按 PB4 进入配对模式所需的时长**：`DEBUG=1` 时为 **200ms**（便于反复排查），否则 **5000ms**（防误触发）。见 `src/peripheral.c` 顶部 |
 
 ### `SK_SIG_DER`：签名格式（重要）
 
@@ -310,20 +311,57 @@ passed 5/5
 - **不支持 `credentialManagement`**：该命令要求 PIN/UV，本实现无 PIN
 - **Attestation 为 `none`**：不提供 `packed` 等可验证的 attestation
 - **BLE 侧 CTAP 传输：设备侧完整实现并验证，但客户端受平台限制**
-  - **设备侧已通过脚本化 GATT 客户端验证**（`tools/ble_gatt_client.py`，
+  - **设备侧已通过脚本化 GATT 客户端完整验证**（`tools/ble_gatt_client.py`，
     基于 `bleak`）：特征发现、版本位读写、`CPLength`、订阅通知、`PING`、
-    `GetInfo` **六项全通**，且与 nRF Connect 手工测试结果一致
-  - **但 Windows（WebAuthn）与 Android 都无法完成经典 BLE FIDO 流程**：
-    前者读特征后放弃、后者更早退出，**均从不订阅通知、从不写请求**
-  - **根因在平台侧**（调研依据见下），**非本项目实现缺陷**：
-    - **Windows Hello** 对蓝牙安全密钥支持不完善（Mozilla Bug 1768622 实测
-      "只提示插入 USB"）
-    - **Android** 系统**显式限制**第三方访问 FIDO GATT 服务（`isFidoSrvcUuid`）
-    - **Chrome 自带的 BLE 认证器支持已于 2020 年移除**，业界转向 caBLE
+    `GetInfo`、**`MakeCredential`、`GetAssertion` 八项全通** —— 覆盖 CTAP2
+    的全部公开命令，且与 nRF Connect 手工测试结果一致
+  - **`tools/ble_dump_gatt.py` 把设备的 GATT 库原样打印**（不做 UUID 查找，
+    避免循环论证）：**四个服务（GAP/GATT/DIS/FIDO）、四个特征、CCCD 描述符，
+    UUID 全部是规范值** —— 设备侧无任何不合规之处
+  - **`tools/ble_probe_windows.py`** 用 6 种"连接姿势"复现 Windows 的行为，
+    **在干净配对状态下全部通过**（含特征读写、订阅）
+  - **Windows（WebAuthn）无法完成经典 BLE FIDO 流程**，且已有**本机三层证据**：
+    - **CtapSrv 有 BLE 提供程序，但创建 FIDO 上下文时报 CNG 层错误
+      `0x80090011`（`NTE_NOT_FOUND`）**，`AAGuid` 恒为全零
+      （= 一个 CTAP 命令都没发出去）
+    - **系统设备树里只注册为蓝牙 LE 设备**（`DEVPKEY_Device_Service: BthLEEnum`），
+      **没有任何 FIDO / WebAuthn 设备接口**
+    - **必须先做系统级蓝牙配对**，否则浏览器弹窗**完全不出现蓝牙选项**
+    - **失败点在 `webauthn.dll`，与浏览器无关** ——
+      **Windows 自带的 FIDO 管理界面同样卡在"打开蓝牙密钥或者插入 USB"**，
+      而它与 Edge 共用同一套 `webauthn.dll`；`bleak` 之所以能通，
+      正因为它**绕过** `webauthn.dll` 直连 WinRT BLE API
+  - **Android** 系统**显式限制**第三方访问 FIDO GATT 服务（`isFidoSrvcUuid`）
+  - **Chrome 自带的 BLE 认证器支持已于 2020 年移除**，业界转向 caBLE
+  - 外部记录一致：**Mozilla Bug 1768622**（"只提示插入 USB"）、Windows 11
+    BLE 密钥管理界面的已知回归（FIDO Dev 邮件列表 2025-07）
+  - **`webauthn.dll` 层面的已知限制**（kanidm/webauthn-rs 的反汇编研究）
+    与**逐条实测结论**：
+    - `MicrosoftCtapBleProvider` **确实存在**（Win10 1903+ / Win11 都有），
+      而 `_BleCreateContext` 正是它的一部分 —— 即我们失败的那个函数
+    - **"Windows 阻止非管理员访问 BTLE FIDO 令牌"** —— **实测不适用**：
+      以管理员身份运行 Edge 后行为完全不变（该限制针对第三方应用经普通
+      蓝牙 API 访问，而 `MicrosoftCtapBleProvider` 在系统服务内运行）
+    - **"某些版本的 `webauthn.dll` 不带 BLE 支持"** —— **实测排除**：
+      本机 `10.0.26100.9278`（Windows 11 25H2 / `10.0.26200`），极新
+    - **"蓝牙适配器不支持 advertising"** —— **实测排除**：
+      本机为 Intel 无线 Bluetooth，能同时承载多个设备的 GATT 服务
+    - 功能标志 **`FidoBleAddressRotation` 仅 Windows 11 存在**，
+      也用在 `_BleCreateContext` 中 —— 目前唯一未排除的具体机制，
+      但因果关系不明确（见文档）
+  - **依 Microsoft Learn 的 passkeys 文档做过延伸排查，全部正常**：
+    Passkey 访问隐私开关（Win11 24H2+ 新增）、Windows Hello 已配置、
+    无企业蓝牙策略（`HKLM\...\Bluetooth` 为空）、`Get-Tpm` 各项均 `True`。
+    **该文档列出的 USB 提示常见原因（无 TPM / Hello 未配置 / PC 无蓝牙）
+    在本机三条都不成立** —— 说明本项目的现象不在其覆盖范围内。
 
-  **需要在真实客户端上验证时，建议走 Linux + `fido2ble`**
-  （把 BLE FIDO 桥接成 USB HID，绕开平台限制）。
-  详见 [BLE 侧实现规划](docs/BLE侧实现规划.md)
+  **结论：根因在平台侧，非本项目实现缺陷。**
+  需要在真实客户端上验证时，建议走 **Linux + `fido2ble`**
+  （把 BLE FIDO 桥接成 USB HID，绕开平台限制），
+  或用 **FIDO Conformance Tool** 验证设备合规性。
+  完整的排查过程（**含已排除的 14 个假设**、Windows 侧三层证据链、
+  `webauthn.dll` 内部机制调研）见
+  [BLE 侧实现规划 §客户端兼容性的根因](docs/BLE侧实现规划.md)
 - **`up=false` 的探测请求会直接放行**：不做用户确认（符合浏览器自动填充探测的需求）
 
 ### 待办

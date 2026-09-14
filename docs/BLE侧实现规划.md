@@ -546,7 +546,141 @@ BLE HID 方向**不应实现**。
 **即：Android 系统主动限制了第三方对 FIDO GATT 服务的访问。** 这解释了为什么设备能被扫描到、
 能配对，却在 Play Services 那一步卡住（"按住按键 5 秒"提示后无后续）。
 
-### Windows：Windows Hello 对蓝牙密钥支持不完善
+### Windows：本机三层证据链（已实测确认）
+
+**这一节最初只有外部调研引用。2026-09 用本项目设备在 Windows 上做了完整排查，
+现已有本机直接证据 —— 三条独立线索指向同一结论。**
+
+#### 证据一：CtapSrv 有 BLE 提供程序，但它卡在"创建 FIDO 对象"
+
+`Microsoft-Windows-WebAuthN/Operational` 事件日志（启用方式：
+`wevtutil sl Microsoft-Windows-WebAuthN/Operational /e:true`）：
+
+```
+Id 2270  Ctap Ble 函数: _GetFidoGattServiceFromServicesResult 位置:
+             错误: 0x80090011. 找不到对象。
+         Ctap Ble 函数: _GetFidoGattService 位置:
+             错误: 0x80090011. 找不到对象。
+         Ctap Ble 函数: _BleCreateContext 位置:
+             错误: 0x80090011. 找不到对象。
+Id 2263  Ctap Ble 设备线程已完成。
+             DevicePath: ble:383b267e348e_0021     <- 我们的设备
+             PairedName: SecureKey
+             AAGuid: {00000000-0000-0000-0000-000000000000}   <- ★ 全零
+             状态: 3
+             状态: 0x10
+             错误: 0x4C7. 操作已被用户取消。
+```
+
+**两个要点**：
+
+- **`0x80090011` = `NTE_NOT_FOUND`** —— 这是 **CNG（Windows 加密 API）** 的错误码，
+  不是普通 Win32 码。说明 Windows 在**为这个蓝牙设备创建凭据容器**时失败。
+- **`AAGuid` 恒为全零** —— 只有 `GetInfo` 成功过才会被填充。**全零 = 一个 CTAP
+  命令都没发出去**，与设备侧串口"连接后只有 RSSI、无任何 `[BLE] MSG rx`"完全一致。
+
+#### 证据二：Windows 从未为设备注册 FIDO 接口
+
+```powershell
+Get-PnpDevice -Class Bluetooth | Where-Object { $_.FriendlyName -match "SecureKey" }
+# Status: OK   Class: Bluetooth   InstanceId: BTHLE\DEV_383B267E348E\...
+
+Get-PnpDeviceProperty -InstanceId "BTHLE\DEV_383B267E348E\..."
+# DEVPKEY_Device_Service : BthLEEnum      <- ★ 只有蓝牙 LE 枚举器
+```
+
+**设备在系统里只是一个"蓝牙 LE 设备"**，**没有任何 FIDO / WebAuthn / CTAP 相关的
+服务或设备接口**。对照真正的 USB 安全密钥（会有 `WINUSB`/`usbccgp` 与
+`FIDO_DEVICE` 之类的接口），差异一目了然。
+
+**这与证据一的 `NTE_NOT_FOUND` 互为印证：那个对象从未被创建。**
+
+#### 证据三：设备侧 GATT 数据库完全合规
+
+`tools/ble_dump_gatt.py` 把设备实际暴露的 GATT 库原样打印（不做任何 UUID 查找，
+避免"用期望值查到了就以为对"的循环论证）：
+
+```
+服务  0000fffd-0000-1000-8000-00805f9b34fb  <<< FIDO 服务
+    特征  f1d0fff1-deaa-ecee-b42f-c9ba7ed623bb  props=['write']         <<< fidoControlPoint
+    特征  f1d0fff2-deaa-ecee-b42f-c9ba7ed623bb  props=['notify']        <<< fidoStatus
+      描述符  0x0026  00002902-...                                     <- CCCD 在位
+    特征  f1d0fff4-deaa-ecee-b42f-c9ba7ed623bb  props=['read','write']  <<< fidoServiceRevisionBitfield
+    特征  f1d0fff3-deaa-ecee-b42f-c9ba7ed623bb  props=['read']          <<< fidoControlPointLength
+
+校验：期望服务 UUID 是否出现在结果里: 是
+      四个特征全部找到
+```
+
+**四个服务（GAP / GATT / DIS / FIDO）、四个特征、CCCD 描述符，UUID 全是规范值。**
+
+#### 排查中排除掉的假设
+
+**这些都被实测否定了**（记录下来，避免后来者重走）：
+
+| 假设 | 排除方式 |
+|---|---|
+| **服务 UUID 编码不对** | `ble_dump_gatt.py` 原样打印，四个 UUID 全对 |
+| **服务注册时序太晚** | 代码顺序：`ble_transport_init()` 在 `GAPRole_PeripheralStartDevice()` 之前 |
+| **连接参数不合适** | `connTimeout=3000`（30s）、间隔 30ms，均在规范内 |
+| **配对级别不够** | 已降为 Security Mode 1 Level 2，且 `bleak` 在同级别下八项全通 |
+| **配对窗口过期** | 把 `PAIRING_WINDOW_MS` 临时放大到 30 分钟，**行为逐行不变** |
+| **设备名不一致** | 确实发现 GAP 名（`Simple Peripheral`）与广播名（`SecureKey`）不符，已修正；**但不是失败原因** |
+| **MTU 太小** | 观测到 MTU 在 23 与 256 之间变化，两种都不影响 Windows 的行为 |
+| **Android 式"系统屏蔽"** | 不适用 —— Windows 的 CtapSrv 确实读到了我们的特征 |
+| **非管理员权限受限** | **以管理员身份启动 Edge 后行为完全不变**（仍只有 RSSI，无任何 `[FIDO]` 交互）|
+| **`webauthn.dll` 版本过旧** | 实测 `10.0.26100.9278`（Windows 11 25H2 / `10.0.26200`），**极新，必带 BLE 提供程序** |
+| **蓝牙适配器能力不足** | Intel 无线 Bluetooth，能同时承载 iPhone / 小米 / 耳机等多个设备及其 GATT 服务 |
+| **浏览器集成有问题** | **Windows 自带的 FIDO 管理界面（设置 → 账户 → 登录选项 → 安全密钥 → 管理）同样卡在"打开蓝牙密钥或者插入 USB"** —— 它不经过浏览器 |
+| **Passkey 访问被系统拒绝** | Win11 24H2+ 新增"通行密钥访问"隐私开关（设置 → 隐私和安全性）。**实测为正常/允许** |
+| **Windows Hello 未配置** | 设置 → 账户 → 登录选项里 PIN 等已配置。**（该文档称"Hello 未配置"会 fallback 到 USB 提示，此处不成立）** |
+| **企业蓝牙策略限制** | `HKLM\SOFTWARE\Policies\Microsoft\Windows\Bluetooth` **为空**，无 MDM/CSP 策略约束配对范围 |
+| **TPM 状态异常** | `Get-Tpm`：`TpmPresent/Ready/Enabled/Activated/Owned` 均为 `True`，`LockedOut=False`。**TPM 完全健康** |
+| **`RestartPending` 导致容器未初始化** | 重启后该标志仍为 `True` —— **它在 TPM 已 Owned 的系统上本就常见，与 FIDO 失败无关**（此项曾被我误判为线索，已纠正）|
+
+**计 14 项，全部排除。**
+
+> 说明：其中"TPM 状态"与"RestartPending"两条来自对 Microsoft Learn
+> [passkeys 文档](https://learn.microsoft.com/zh-cn/windows/security/identity-protection/passkeys/)
+> 的延伸排查。该文档列出的 "Insert your security key into the USB port"
+> 常见原因（**无 TPM / Windows Hello 未配置 / PC 无蓝牙**）**在本机三条都不成立**，
+> 说明本项目的现象不在该文档覆盖范围内 —— 它属于"**蓝牙 + FIDO2 + 经典 BLE
+> 认证器**"这条组合路径，而这恰是 Windows 支持最弱的一条。
+
+#### 已确认为**必要前提**的一点
+
+**必须先做系统级蓝牙配对**，否则浏览器弹窗**完全不出现蓝牙选项**：
+
+| Windows 配对记录 | 浏览器弹窗 |
+|---|---|
+| **无** | **只有"插入 USB"，无蓝牙** |
+| **有** | **出现蓝牙选项**，但底层 `NTE_NOT_FOUND`，仍无法完成 |
+
+**即 Windows 只从"已配对的 BLE 设备列表"里找认证器，不主动扫描。**
+（这与 `DevicePath: ble:<MAC>_<端口>` 的格式一致 —— 那是配对记录的标识。）
+
+#### 决定性的一条：失败点在 `webauthn.dll`，与浏览器无关
+
+**上表最后一行是整轮排查的收束点。**
+
+| 路径 | 底层 | 结果 |
+|---|---|---|
+| **Edge 浏览器** | `webauthn.dll` → `MicrosoftCtapBleProvider` | ❌ 失败 |
+| **Windows 设置界面**（账户 → 登录选项 → 安全密钥）| **同一个 `webauthn.dll`** → **同一个提供程序** | ❌ **失败** |
+| **`ble_probe_windows.py`**（`bleak`）| **直接调 WinRT BLE API**，**绕过 `webauthn.dll`** | ✅ 6 项全通 |
+| **`ble_gatt_client.py`**（`bleak`）| **同上** | ✅ 八项 CTAP2 全通 |
+
+**浏览器与系统界面共用同一套底层**，所以它们失败在同一个地方 —— 这排除了
+"浏览器集成有问题"这个最后的可能。**而 `bleak` 成功，正因为它绕开了 `webauthn.dll`。**
+
+**因此：问题在 Windows 的 `MicrosoftCtapBleProvider` 实现内，不在设备、不在浏览器、不在本项目代码。**
+
+**（附带说明：据此也推翻了一个早期的错误推断 —— 曾从 `edge://device-log` 里
+只有 enclave / Windows Hello 的 discovery 列表，推断"浏览器不扫描 BLE"。
+实际上 CtapSrv 是独立服务，不在浏览器进程的 discovery 清单里；
+真正的原因是底层提供程序建不起 FIDO 上下文。）**
+
+### 与之对照的外部记录
 
 Mozilla 工程师的实测记录：
 
@@ -556,6 +690,119 @@ Mozilla 工程师的实测记录：
 
 以及 FIDO Dev 邮件列表（2025-07）的报告：**Windows 11 的 BLE 密钥管理
 （设置 → 账户 → 登录选项 → 安全密钥 → 管理）出现过回归并崩溃**，微软方面已确认该回归。
+
+**本机实测与这些记录一致**，并可补充一句：**Windows 甚至能列出蓝牙选项、
+能连上设备、能读特征，却在创建 FIDO 上下文时以 CNG 层的 `NTE_NOT_FOUND` 失败。**
+
+### Windows 内部机制（`webauthn.dll` 调研）
+
+**失败函数不是笔误 —— 它们是 `webauthn.dll` 里真实存在的内部符号。**
+kanidm/webauthn-rs 项目对 `webauthn.dll` 做过反汇编
+（[Issue #221](https://github.com/kanidm/webauthn-rs/issues/221)），确认 Windows
+把 FIDO 传输抽象成四个**提供程序**，**Windows 10 1903+ 与 Windows 11 都有**：
+
+| 提供程序 | 传输 |
+|---|---|
+| `MicrosoftCtapHidProvider` | USB HID |
+| `MicrosoftCtapNfcProvider` | PC/SC（WinSCard）|
+| **`MicrosoftCtapBleProvider`** | **BLE** ← 本项目走这条 |
+| `MicrosoftCtapTestProvider` | 测试用 |
+
+**而 `_BleCreateContext()` 正是 `MicrosoftCtapBleProvider` 的一部分** ——
+也就是我们日志里报 `NTE_NOT_FOUND` 的那个函数。
+**注意：`MicrosoftCtapBleProvider` 实现的是"原生 FIDO BLE GATT"，
+不是 caBLE/hybrid** —— 所以它理应与本项目的实现对接。
+
+#### 三条已知的限制
+
+**其一：Windows 阻止非管理员访问 BTLE FIDO 令牌**（最值得先试的一条）
+
+`webauthn-authenticator-rs` 的
+[文档](https://docs.rs/webauthn-authenticator-rs/0.5.0/webauthn_authenticator_rs/bluetooth/index.html)
+明确写出：
+
+> **"On Windows, the OS blocks non-Administrator access to BTLE FIDO tokens,
+> returning 'permission denied' errors via normal Bluetooth APIs.
+> This has existed since Windows 10 build 1903 (19H1) and later.
+> This does not affect caBLE authenticators."**
+
+**该文档同时给出了他们的做法**：
+
+> **"...requires manually pairing the authenticator in Device Manager first."**
+
+**这解释了本项目观察到的"必须先系统级配对，弹窗才出现蓝牙选项"**
+—— 不是我们的特例，而是 Windows 的既有要求。
+
+**实测结果：这条限制对本项目不适用。**
+
+**以管理员身份启动 Edge（先彻底结束所有 msedge 进程）后，行为与普通权限完全一致**
+—— 仍然只有 `link ESTABLISHED` / `RSSI` / `link TERMINATED`，
+**没有任何 `[FIDO]` 交互，`AAGuid` 依旧全零**。
+
+> 操作要点（供将来复核）：Edge / Chrome 有常驻后台进程会复用已有实例，
+> 必须**先彻底结束所有进程**再 `Start-Process msedge -Verb RunAs`，
+> 否则只是把窗口带到前台，权限并不会提升。
+>
+> 该限制针对的是**第三方应用通过普通蓝牙 API 访问 BTLE FIDO 令牌**；
+> 而 `MicrosoftCtapBleProvider` 在系统服务内运行，本就不受此限制。
+> 这也解释了为什么 `bleak`（普通权限）能访问设备 —— 二者不是同一条路径。
+
+**其二：`FidoBleAddressRotation` 仅存在于 Windows 11**
+
+同一份反汇编发现：功能标志 `FidoBleAddressRotation`（值 `21326400`）
+**只在 Windows 11 的 `webauthn.dll` 里出现，Windows 10 没有**，
+且它被用在 **`_BleCreateContext()`** 中（即我们失败的那个函数）。
+
+**这是 BLE 隐私特性**（设备周期性更换 MAC 地址以抗追踪）。
+**本项目当前使用固定公共地址、不做地址轮换**。
+
+**管理员权限已实测无效，所以这是目前唯一还没排除的具体机制** ——
+但要注意：**地址轮换影响的是"客户端能否稳定认出同一个设备"**，
+而本项目的现象是"能认出、能连上、能读特征，只是建不起 FIDO 上下文"，
+**两者未必相关**。若要试探，需先确认 WCH 协议栈是否支持地址轮换
+（`GAP_ConfigDeviceAddr` / 隐私特性相关 API）。
+
+**其三：某些版本的 `webauthn.dll` 根本不带 BLE 支持**
+
+Chromium 的提交
+（["fido/win: gate Windows WebAuthn API availability on a minimum version"](https://openhub.net/p/chrome/commits/2406189862)）
+提到：
+
+> **"There are versions of `webauthn.dll` that ship without BLE support."**
+
+**本机实测（已排除）**：
+
+```powershell
+(Get-Item C:\Windows\System32\webauthn.dll).VersionInfo | Format-List FileVersion
+# FileVersion : 10.0.26100.9278 (WinBuild.160101.0800)
+
+Get-ComputerInfo | Select-Object OsVersion, WindowsProductName, WindowsVersion
+# OsVersion : 10.0.26200    WindowsProductName : Microsoft Windows 11 专业工作站版
+```
+
+**Windows 11 25H2 + 极新的 `webauthn.dll`，必然包含 BLE 提供程序** ——
+而且事件日志里那些 `Ctap Ble 函数: ...` 条目本身就证明它在运行。
+
+另一个相关提交
+（["fido: disable caBLE if the BLE adapter does not support advertising"](https://chromium.googlesource.com/chromium/src.git/+/8dfaaffe3ccc5323785245a9ecf8670a7d3f20a5)）
+则提到**不少 Windows 蓝牙适配器不支持 advertising**。
+
+**同样已排除**：本机适配器为 **Intel 无线 Bluetooth**，
+`Get-PnpDevice -Class Bluetooth` 能同时列出 iPhone / 小米 14 / 耳机等多个
+设备及其 GATT 服务，说明适配器能力完好。
+
+#### 与本项目现象的对应关系
+
+| 现象 | 机制判断 |
+|---|---|
+| **CtapSrv 能连接、能读特征** | 蓝牙栈层面的普通 GATT 操作，不涉及 FIDO 上下文 |
+| **`_BleCreateContext` → `NTE_NOT_FOUND`** | **建不起 FIDO 上下文** —— 已排除权限、DLL 版本、适配器三类外部原因 |
+| **`AAGuid` 恒为全零** | 上下文建不起来，一个 CTAP 命令也发不出去 |
+| **`bleak` 却八项全通** | **它绕过 `webauthn.dll`**，走 WinRT BLE API 直连 |
+| **浏览器与系统界面同样失败** | **两者共用 `webauthn.dll`** —— 失败点在底层提供程序，与调用方无关 |
+
+**结论：设备侧正确、客户端失败**；失败点**确定在 Windows 的
+`MicrosoftCtapBleProvider` 实现内**，且**所有可调的外部变量均已排除**。
 
 ### 行业现状
 
@@ -569,14 +816,19 @@ Mozilla 工程师的实测记录：
 
 ---
 
-## 可行的验证途径（若将来有条件）
+## 可行的验证途径
+
+**Windows 上按优先级排列 —— 前三条成本最低，值得先试**：
 
 | 途径 | 说明 |
 |---|---|
-| **Linux + `fido2ble`** | 用 [PoneBiometrics/fido2ble](https://github.com/PoneBiometrics/fido2ble) 把 BLE FIDO 设备桥接成 USB HID——**绕过 Windows/Android 的平台限制，最干净** |
+| **① FIDO Conformance Tool** | 按规范测试，**不依赖操作系统** —— **最能证明设备侧合规，且完全绕开 Windows 的 FIDO 实现**。建议优先做 |
+| **② Linux + `fido2ble`** | 用 [PoneBiometrics/fido2ble](https://github.com/PoneBiometrics/fido2ble) 把 BLE FIDO 设备桥接成 USB HID。它对 BLE 侧的访问走 BlueZ，**不经过 Windows 的 `webauthn.dll`**，是目前唯一已知能在 Windows 上"实际用起来"的方案 |
+| **③ Android + 系统级 FIDO 管理界面** | 而非浏览器发起 |
 | **旧版 Android（8~10）** | 在系统限制收紧之前可能可用 |
-| **FIDO Conformance Tool** | 按规范测试，不依赖操作系统 |
-| **Android + 系统级 FIDO 管理界面** | 而非浏览器发起 |
+| **修改设备的 BLE 地址策略（试探性）** | 对应 `FidoBleAddressRotation`（仅 Win11 存在，用于 `_BleCreateContext`）。需先确认 WCH 协议栈是否支持地址轮换 —— **优先级低，因果关系不明确** |
+
+**~~管理员身份运行浏览器~~、~~查 `webauthn.dll` 版本~~、~~换 Win11 23H2+ 机器~~ 三条均已实测排除，见上文"排查中排除掉的假设"。**
 
 > `fido2ble` 的实现已核对：它使用的 **UUID（4 个，无 `0x2A28`）、命令码、
 > 分片逻辑与本项目完全一致**——这从另一个角度印证了设备侧实现的正确性。
@@ -590,7 +842,37 @@ Mozilla 工程师的实测记录：
 -D BLE_BUFF_MAX_LEN=100     ; ATT_MTU: 23 -> 96
 ```
 
-**临时诊断均已清理**（`BLE_TRANSPORT_DUMP`、`BLE_ERASE_BONDS_ON_BOOT` 及各处 `PRINT`）。
+**临时诊断的状态**：
+
+- **已移除**：`BLE_TRANSPORT_DUMP` 等可选的详细 dump 开关
+- **仍在代码里、默认关闭**：`BLE_ERASE_BONDS_ON_BOOT`（`platformio.ini` 中已注释）。
+  **保留是因为它记录了一条教训**：`GAPBondMgr_SetParameter(GAPBOND_ERASE_ALLBONDS)`
+  **必须**在 `GAPRole_PeripheralStartDevice()` **之后**调用 ——
+  放在 `Peripheral_Init()` 里会让广播起不来（实测设备直接扫不到）。
+  `src/peripheral.c` 里对应代码块上方有完整说明。
+- **保留的调试打印**：`[FIDO] read/write`、`[BLE] link ESTABLISHED/pair/MG` 等。
+  **它们配合 `tools/ble_gatt_client.py` 排障效率很高，故未移除**；
+  若要精简，可考虑收进 `#ifdef` 宏。
+
+### 本轮新增的验证工具
+
+| 脚本 | 用途 |
+|---|---|
+| **`tools/ble_gatt_client.py`** | 完整 CTAP2 流程（8 项：特征/版本位/CPLength/订阅/PING/GetInfo/MakeCredential/GetAssertion）|
+| **`tools/ble_dump_gatt.py`** | **原样打印 GATT 库** —— 不做 UUID 查找，避免"用期望值查到了就以为对"的循环论证 |
+| **`tools/ble_probe_windows.py`** | **6 种"连接姿势"**，复现 Windows 的行为路径（含特征读写、订阅）|
+
+**三者配合的使用方式**：
+
+```bash
+python tools/ble_dump_gatt.py        # 1. 先确认 GATT 库本身合规
+python tools/ble_probe_windows.py    # 2. 再确认各种连接姿势下读写可用
+python tools/ble_gatt_client.py      # 3. 最后跑完整 CTAP2 流程
+```
+
+> 三者都要求**先在 Windows 里删除该设备的配对记录**再运行 ——
+> 否则 Windows 蓝牙栈会抢占（单连接外设），出现"能连上但读写报
+> `0x800704C7`"的假失败。
 
 ---
 
@@ -605,7 +887,7 @@ Mozilla 工程师的实测记录：
 **直接作为标准 GATT 客户端**按 CTAP 2.1 §11.4.6 的规范流程操作设备，
 **绕开浏览器/系统的 FIDO 集成层**。
 
-### 结果：六项全部通过
+### 结果：八项全部通过
 
 ```
 [1] 特征发现        ✓ fidoControlPoint(write) fidoStatus(notify)
@@ -615,7 +897,32 @@ Mozilla 工程师的实测记录：
 [4] 订阅通知        ✓
 [5] PING            ✓ 回显正确
 [6] GetInfo         ✓ CTAP 状态成功，CBOR 完整（含 FIDO_2_0 声明）
+[7] MakeCredential  ✓ CTAP 状态成功，响应 177 字节
+                      -> UP 闸门（按住 PB4）、凭证写入 Flash、attestation(none)
+                      -> **多帧通知发送路径首次验证**
+[8] GetAssertion    ✓ CTAP 状态成功，**找到了 [7] 刚写入的凭证**
+                      -> 返回 credential + authData + DER 签名 + userHandle
 ```
+
+**[8] 能取回 [7] 创建的凭证**，说明凭证索引、密钥对读写、Flash 持久化全部正常。
+
+### 设备侧验证覆盖（CTAP2 全部公开命令）
+
+| 层 | 验证方式 | 状态 |
+|---|---|---|
+| 广播（含 Service Data 配对标志） | `bleak --scan` + nRF Connect | ✓ |
+| 配对（Security Mode 1 Level 2） | 设备日志 `pair state` 0/1/3 | ✓ |
+| 特征发现（4 个） | `bleak` [1] | ✓ |
+| 版本位读写 | `bleak` [2] | ✓ |
+| `fidoControlPointLength` | `bleak` [3] | ✓ |
+| 订阅通知 | `bleak` [4] | ✓ |
+| PING（封装层） | `bleak` [5] | ✓ |
+| GetInfo | `bleak` [6] | ✓ |
+| **MakeCredential** | `bleak` [7] | ✓ |
+| **GetAssertion** | `bleak` [8] | ✓ |
+
+> 未覆盖的只有 `credentialManagement` 与 PIN 相关命令 —— 本实现明确不支持
+> （见 README 的"功能限制"）。
 
 **这一步的意义**：**同一固件、同一个 Windows 系统**，
 
@@ -631,20 +938,34 @@ Mozilla 工程师的实测记录：
 
 ## 二、两个平台的实测行为
 
-### Windows（PC 网页）
+### Windows（PC 网页）—— 已确认平台不支持
+
+**本机 `edge://device-log` 的直接证据**：
 
 ```
-新配对时  -> 读 fidoControlPointLength -> 读 fidoServiceRevisionBitfield -> 停止
-已绑定时  -> 什么都不读（连特征都不访问）
+FIDODebug  Adding discovery for enclave
+FIDODebug  Adding Windows Hello discovery          <- 只有这两种
+FIDODebug  Initializing FIDO discoveries
+FIDOEvent  Not starting hybrid because Windows handles it.
 ```
 
-**从不订阅通知、从不写请求。** 与 Mozilla 工程师的实测记录一致：
+**Edge 在 Windows 上注册的 discovery 只有 enclave 与 Windows Hello**，
+**没有任何 BLE / GATT discovery** —— 即**浏览器根本不扫描 BLE 认证器**，
+把这类工作完全交给 Windows。
+
+**而 Windows 的界面层也不提供蓝牙选项**：在站点上选择"安全密钥"后，
+弹出窗口**只提示"将密钥插入 USB 口"**，没有蓝牙这一项。
+这与 Mozilla 工程师的记录**逐字吻合**：
 
 > **"As far as I can tell Windows Hello does not support Bluetooth security keys
 > (when I try to add a security key it asks to insert it in the USB port)."**
 > — Bugzilla 1768622
 
-**Windows 能识别 BLE 认证器，但没有能力完成完整交互。**
+**串口日志里的 `link ESTABLISHED` / 特征读取不是浏览器发起的** ——
+那是 **Windows 蓝牙栈在自动重连已配对设备**（以及做服务探测），
+与浏览器的 FIDO 流程无关。所以日志里能看到连接，但浏览器侧毫无进展。
+
+**结论：Windows 平台不支持经典 BLE FIDO 认证器**（架构决定，不是配置问题）。
 
 ### Android
 
