@@ -127,6 +127,22 @@ static uint8_t s_selectedRevision = 0;
 
 /*********************************************************************
  * Profile Attributes - Table
+ *
+ * ★ 链路安全（CTAP 2.1 §11.4.3）：
+ *   "the authenticator SHALL enforce Security Mode 1, Level 2 ... or Level 3
+ *    ... **before any FIDO messages are exchanged**."
+ *
+ *   约束点是"交换 FIDO 消息**之前**"，所以承载 FIDO 消息的属性必须要求加密：
+ *     fidoControlPoint           -> ENCRYPT_WRITE
+ *     fidoStatus 的 CCCD         -> ENCRYPT_READ | ENCRYPT_WRITE
+ *     fidoServiceRevisionBitfield-> ENCRYPT_READ | ENCRYPT_WRITE
+ *     fidoControlPointLength     -> ENCRYPT_READ
+ *   未加密的连接读写这些属性会得到 ATT_ERR_INSUFFICIENT_ENCRYPTION(0x0F)，
+ *   Windows/Android 的 BLE 栈收到该错误后会**自动发起配对/加密**再重试 ——
+ *   这正是规范期望的强制时机，无需在应用层显式发起加密。
+ *
+ *   服务声明与特征声明**不**加加密位：客户端必须先做服务发现才知道有这些
+ *   特征，加密前就把它们挡住会让客户端根本找不到服务。
  */
 
 static gattAttribute_t s_ProfileAttrTbl[] = {
@@ -147,7 +163,7 @@ static gattAttribute_t s_ProfileAttrTbl[] = {
     },
     {
         {ATT_UUID_SIZE, fido_ControlPointUUID},      /* idx 2 */
-        GATT_PERMIT_WRITE,
+        GATT_PERMIT_WRITE | GATT_PERMIT_ENCRYPT_WRITE,
         0,
         &s_ControlPointValue
     },
@@ -167,7 +183,8 @@ static gattAttribute_t s_ProfileAttrTbl[] = {
     },
     {
         {ATT_BT_UUID_SIZE, clientCharCfgUUID},       /* idx 6: CCCD */
-        GATT_PERMIT_READ | GATT_PERMIT_WRITE,
+        GATT_PERMIT_READ | GATT_PERMIT_WRITE |
+            GATT_PERMIT_ENCRYPT_READ | GATT_PERMIT_ENCRYPT_WRITE,
         0,
         (uint8_t *)s_StatusCCCD
     },
@@ -187,7 +204,8 @@ static gattAttribute_t s_ProfileAttrTbl[] = {
     },
     {
         {ATT_UUID_SIZE, fido_ServiceRevisionBitfieldUUID}, /* idx 7 */
-        GATT_PERMIT_READ | GATT_PERMIT_WRITE,
+        GATT_PERMIT_READ | GATT_PERMIT_WRITE |
+            GATT_PERMIT_ENCRYPT_READ | GATT_PERMIT_ENCRYPT_WRITE,
         0,
         &s_RevBitfieldValue
     },
@@ -200,7 +218,7 @@ static gattAttribute_t s_ProfileAttrTbl[] = {
     },
     {
         {ATT_UUID_SIZE, fido_ControlPointLengthUUID},/* idx 9 */
-        GATT_PERMIT_READ,
+        GATT_PERMIT_READ | GATT_PERMIT_ENCRYPT_READ,
         0,
         s_CPLengthValue
     },

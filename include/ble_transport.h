@@ -33,12 +33,31 @@ extern "C" {
  * CONSTANTS
  */
 
-/* 命令码（全部满足 bit7 = 1，这也正是初始帧的标志） */
-#define FIDO_BLE_CMD_PING               0x81
-#define FIDO_BLE_CMD_KEEPALIVE          0x82
-#define FIDO_BLE_CMD_MSG                0x83
-#define FIDO_BLE_CMD_CANCEL             0xBE
-#define FIDO_BLE_CMD_ERROR              0xBF
+/* 命令码 —— 取自 CTAP 2.1 §11.4.4.3（"Command, Status, and Error constants"）
+ *
+ * ★ BLE 传输层有**自己的**命令码表，与 USB HID（CTAPHID）不同，不能混用：
+ *
+ *     PING       0x81      ← 与 HID 相同
+ *     KEEPALIVE  0x82      ← ★ 与 HID 的 0xBB 不同
+ *     MSG        0x83      ← 与 HID 相同
+ *     CANCEL     0xbe      ← ★ 与 HID 的 0x91 不同
+ *     ERROR      0xbf      ← 与 HID 相同
+ *
+ * 规范 §11.4.4.3 的原表就是上面这五个值，并注明 "These values are identical
+ * to the HID transport values." —— 那句指的是**常量体系同源**，不是数值逐个
+ * 相同；表里的值才是权威。
+ *
+ * （曾有一次性把 KEEPALIVE/CANCEL 改成 HID 的 0xBB/0x91，那是错的，已改回。）
+ *
+ * 另：§11.4.4.3 的 KEEPALIVE 状态字节 ——
+ *     PROCESSING 0x01
+ *     UP_NEEDED  0x02
+ */
+#define FIDO_BLE_CMD_PING               0x81    /* PING      */
+#define FIDO_BLE_CMD_KEEPALIVE          0x82    /* KEEPALIVE */
+#define FIDO_BLE_CMD_MSG                0x83    /* MSG       */
+#define FIDO_BLE_CMD_CANCEL             0xBE    /* CANCEL    */
+#define FIDO_BLE_CMD_ERROR              0xBF    /* ERROR     */
 
 /* KEEPALIVE 的状态字节 */
 #define FIDO_BLE_KA_PROCESSING          0x01
@@ -53,6 +72,20 @@ extern "C" {
  * 取 512 既留足余量，又避免在 RAM 已紧张时再吃掉 1KB（见下方说明）。
  * 若将来遇到更长的消息，改大此值即可（每增加 N 就多占 2N 字节 RAM）。 */
 #define FIDO_BLE_MAX_MSG                512
+
+/* 封装层 ERROR 帧的错误码（CTAP 2.1 §11.4.4.3）
+ *
+ * ★ ERROR 帧的格式是  STAT(0xBF) | HLEN | LLEN | <错误码>
+ *   最后那个 DATA 字段是**错误码**，不是 STAT 的值 —— 两者容易写混，
+ *   写错会让客户端读到未定义错误码（0xBF 在表里没有定义）。
+ * 规范只定义了下面这几个（0x0a/0x0b 是 HID 保留值，BLE 不用）。 */
+#define FIDO_BLE_EC_INVALID_CMD         0x01    /* 命令未知/无效 */
+#define FIDO_BLE_EC_INVALID_PAR         0x02    /* 参数无效或缺失 */
+#define FIDO_BLE_EC_INVALID_LEN         0x03    /* 请求长度无效 */
+#define FIDO_BLE_EC_INVALID_SEQ         0x04    /* 序号无效 */
+#define FIDO_BLE_EC_REQ_TIMEOUT         0x05    /* 请求超时 */
+#define FIDO_BLE_EC_BUSY                0x06    /* 设备忙，客户端可稍后重试 */
+#define FIDO_BLE_EC_OTHER               0x7F    /* 其它未指定错误 */
 
 /*********************************************************************
  * PUBLIC FUNCTIONS
@@ -100,6 +133,14 @@ void ble_transport_pending_poll(void);
  * @brief 当前每帧可承载的最大字节数
  */
 uint16_t ble_transport_max_frame(void);
+
+/**
+ * @brief 客户端完成 CCCD 订阅后触发参数更新（由 fido_service 回调转来）
+ *
+ * 在 FIDO_EVT_STATUS_NOTI_ENABLED 事件中调用，此时客户端已完成
+ * GATT 发现和 CCCD 订阅，参数更新不会干扰 GATT 操作。
+ */
+void ble_transport_on_cccd_enabled(void);
 
 #ifdef __cplusplus
 }

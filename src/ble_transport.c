@@ -137,6 +137,19 @@ void ble_transport_set_mtu(uint16_t mtu)
 }
 
 /**
+ * @brief 客户端完成 CCCD 订阅后触发参数更新
+ *
+ * 在 FIDO_EVT_STATUS_NOTI_ENABLED 回调中调用，此时客户端已完成
+ * GATT 发现和 CCCD 订阅，参数更新不会干扰 GATT 操作。
+ */
+void ble_transport_on_cccd_enabled(void)
+{
+    /* 调用 peripheral.c 的参数更新入口 */
+    extern void Peripheral_RequestParamUpdate(void);
+    Peripheral_RequestParamUpdate();
+}
+
+/**
  * @brief 单次通知能承载的最大字节数 = ATT_MTU - 3（ATT 层的 3 字节头）
  */
 static uint16_t s_notify_max(void)
@@ -272,6 +285,8 @@ static void ble_transport_event_cb(fido_evt_t *p_evt)
         case FIDO_EVT_STATUS_NOTI_ENABLED:
             /* 记下订阅的连接，通知要发到同一个连接上 */
             s_conn = p_evt->connHandle;
+            /* 客户端已完成 GATT 发现和 CCCD 订阅，此时触发参数更新是安全的 */
+            ble_transport_on_cccd_enabled();
             break;
 
         case FIDO_EVT_STATUS_NOTI_DISABLED:
@@ -326,9 +341,12 @@ static void handle_frame(void)
 
             if(len < 1)
             {
-                /* 封装层错误：载荷连 CTAP 命令字节都没有 */
+                /* 封装层错误：载荷连 CTAP 命令字节都没有。
+                 * §11.4.4.2：ERROR 帧的 DATA 是**错误码**（这里取 ERR_INVALID_LEN
+                 * 更贴切：请求载荷长度不合法），不是 STAT 的值 —— 早期误把
+                 * FIDO_BLE_CMD_ERROR(0xBF) 填进 DATA，客户端会读到一个未定义的错误码。 */
                 uint8_t err[1];
-                err[0] = FIDO_BLE_CMD_ERROR;
+                err[0] = FIDO_BLE_EC_INVALID_LEN;
                 send_frame(FIDO_BLE_CMD_ERROR, err, 1);
                 break;
             }
@@ -369,20 +387,28 @@ static void handle_frame(void)
         }
 
         case FIDO_BLE_CMD_CANCEL:
-            /* 取消未完成的操作。按规范 CANCEL 本身**不产生响应**。 */
+            /* §11.4.8：收到 CANCEL 时，若有可取消的挂起请求，
+             *   - 必须取消它，且**被取消的那个请求**必须回
+             *     CTAP2_ERR_KEEPALIVE_CANCEL（CTAP 2.3 §6.3 = 0x2D）
+             *   - 而 CANCEL 本身**绝不能**有任何响应
+             * 客户端依赖 0x2D 区分"用户取消"与"设备失联"，不能只静默丢弃。 */
             SK_LOG("ble: cancel");
             if(s_ctap_pending)
             {
+                uint8_t body[1];
                 s_ctap_pending = 0;
+                body[0] = CTAP_ERR_KEEPALIVE_CANCEL;
+                send_frame(FIDO_BLE_CMD_MSG, body, 1);   /* 回的是被取消的请求 */
                 ctap_abort_pending();
             }
-            break;
+            break;                                        /* CANCEL 自身不回复 */
 
         default:
         {
-            /* 不支持的命令用 ERROR 帧回应 */
+            /* 不支持的命令用 ERROR 帧回应。
+             * §11.4.4.2：DATA 是**错误码**，不是 STAT 的值。 */
             uint8_t err[1];
-            err[0] = FIDO_BLE_CMD_ERROR;
+            err[0] = FIDO_BLE_EC_INVALID_CMD;
             send_frame(FIDO_BLE_CMD_ERROR, err, 1);
             SK_LOG("ble: unsupported cmd %02X", rx_cmd);
             break;
@@ -407,9 +433,15 @@ void ble_transport_on_write(uint16_t connHandle, const uint8_t *data, uint16_t l
     {
         if((data[0] & 0x80) && data[0] == FIDO_BLE_CMD_CANCEL)
         {
+            /* §11.4.8：被取消的请求必须回 CTAP2_ERR_KEEPALIVE_CANCEL(0x2D)，
+             * CANCEL 本身不回复。这里与 handle_frame() 的 CANCEL 分支同理 ——
+             * 挂起期间 CANCEL 走的是这条快路径（不等整帧收完）。 */
+            uint8_t body[1];
             s_ctap_pending = 0;
+            body[0] = CTAP_ERR_KEEPALIVE_CANCEL;
+            send_frame(FIDO_BLE_CMD_MSG, body, 1);
             ctap_abort_pending();
-            SK_LOG("ble: cancelled while pending");
+            SK_LOG("ble: cancelled while pending -> 0x2D");
         }
         return;
     }
@@ -473,7 +505,8 @@ void ble_transport_on_write(uint16_t connHandle, const uint8_t *data, uint16_t l
             rx_active = 0;
             return;
         }
-        rx_seq++;
+        /* §11.4.10：期望的 SEQ 也按 0x00..0x7f 回绕（与发送侧对称） */
+        rx_seq = (uint8_t)((rx_seq + 1) & 0x7F);
 
         n = (uint16_t)(len - 1);
         if((uint16_t)(rx_len + n) > rx_total)
@@ -498,6 +531,12 @@ void ble_transport_on_write(uint16_t connHandle, const uint8_t *data, uint16_t l
  * @brief 发送调度（由主循环调用）
  *
  * 每次调用尽量把待发内容推出去；一帧一个通知，避免在 GATT 回调里连发。
+ *
+ * ★ 通知发送失败时**丢弃整个帧**，不保留重试。
+ *   失败最常见的原因是客户端尚未订阅 fidoStatus（cccd=0x0000）——
+ *   而按 §11.4.14，客户端必须先启用通知并等待 ATT 确认才能发 FIDO 消息。
+ *   这是客户端违规，设备没有义务为它空转：旧实现的"保留待发"会让主循环
+ *   每轮重试一次，既费电又把日志刷爆（实测未订阅时同一行连打数十次）。
  */
 void ble_transport_pump(void)
 {
@@ -517,7 +556,18 @@ void ble_transport_pump(void)
         n = (tx_len > s_notify_max()) ? s_notify_max() : tx_len;
         if(fido_status_notify(s_conn, tx_buf, n) != SUCCESS)
         {
-            return;                     /* 通知失败（未订阅等）：保留待发 */
+            /* 通知发送失败 —— 最常见的原因是客户端尚未订阅 fidoStatus
+             * （cccd=0x0000）。按 §11.4.14，客户端必须先启用通知并等 ATT 确认
+             * 才能发 FIDO 消息，所以这是**客户端违规**，设备没有义务为它空转：
+             * 直接**丢弃**该帧，不再重试。
+             *
+             * （旧实现是"保留待发"，结果主循环每轮都重试一次 —— 忙等 + 日志
+             *   刷屏；实测未订阅时同一条 "notify SKIP" 会连打数十次。） */
+            SK_LOG("ble: notify failed -> drop frame cmd=%02X", tx_cmd);
+            tx_active = 0;
+            tx_offset = 0;
+            tx_seq    = 0;
+            return;
         }
         tx_offset = n;
     }
@@ -540,11 +590,20 @@ void ble_transport_pump(void)
          * 通过一次通知送出。为此把载荷整体后移到预留位之后 —— 载荷不大
          * （<= MTU），这次搬运的代价可以接受。 */
         memmove(tx_buf + tx_offset + 1, tx_buf + tx_offset, n);
-        tx_buf[tx_offset] = tx_seq++;
+        /* §11.4.10：序号 0x00..0x7f，**到 0x7f 后必须回绕到 0**。
+         * 直接 tx_seq++ 会走到 0x80（bit7 被置起，客户端会把它当成新的初始帧）。
+         * 本实现的响应长度远达不到 128 个续帧，但仍按规范掩码。 */
+        tx_buf[tx_offset] = tx_seq;
+        tx_seq = (uint8_t)((tx_seq + 1) & 0x7F);
         if(fido_status_notify(s_conn, tx_buf + tx_offset, (uint16_t)(n + 1)) != SUCCESS)
         {
-            /* 发送失败：把刚插入的 SEQ 抹掉，保持偏移不变以便重试 */
-            memmove(tx_buf + tx_offset, tx_buf + tx_offset + 1, n);
+            /* 同上：整个帧作废，不再回滚重试。
+             * tx_buf 里的内容会被下一个请求覆盖，所以上面为插 SEQ 做的
+             * memmove 后移位不必还原。 */
+            SK_LOG("ble: notify failed (cont) -> drop frame cmd=%02X", tx_cmd);
+            tx_active = 0;
+            tx_offset = 0;
+            tx_seq    = 0;
             return;
         }
         tx_offset += n;

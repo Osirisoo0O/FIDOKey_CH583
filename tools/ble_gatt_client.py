@@ -30,6 +30,7 @@ import argparse
 import asyncio
 import struct
 import sys
+import time
 
 try:
     from bleak import BleakClient, BleakScanner
@@ -124,8 +125,42 @@ class FidoBleLink:
             seq += 1
 
     async def request(self, cmd: int, payload: bytes, timeout=5.0):
+        """发一个命令并等**真正的响应**。
+
+        ★ 必须跳过 KEEPALIVE(0x82)。设备在等待用户按确认(UP)期间会按
+        §11.4.9 每 500ms 发一次保活帧，载荷是 1 字节状态：
+            0x01 PROCESSING —— 处理中
+            0x02 UP_NEEDED  —— 等用户按键
+        这些**不是命令响应**。旧实现直接返回收到的第一帧，于是把
+        KEEPALIVE(UP_NEEDED) 当成了 CTAP 状态码 0x02 报错 ——
+        实测 MakeCredential 因此被误判为"状态=0x02 失败"，
+        而设备其实已正确进入等待确认状态。
+        """
         await self.write_frame(cmd, payload)
-        return await self.recv(timeout)
+        deadline = time.monotonic() + timeout
+        hinted = False
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise asyncio.TimeoutError()
+            got_cmd, got = await self.recv(left)
+            if got_cmd == CMD_KEEPALIVE:
+                st = got[0] if got else 0
+                if st == 0x02 and not hinted:
+                    hinted = True
+                    print("    （设备在等用户确认 —— 请按住 PB4 按键）")
+                continue
+            if got_cmd == CMD_ERROR:
+                # 封装层错误帧（CTAP 2.1 §11.4.4.2）：DATA 是错误码，不是 CTAP 状态。
+                # 同样不能当成命令响应用。
+                ec = got[0] if got else 0
+                ename = {0x01: "ERR_INVALID_CMD", 0x02: "ERR_INVALID_PAR",
+                         0x03: "ERR_INVALID_LEN", 0x04: "ERR_INVALID_SEQ",
+                         0x05: "ERR_REQ_TIMEOUT", 0x06: "ERR_BUSY",
+                         0x7F: "ERR_OTHER"}.get(ec, "?")
+                print("    （设备回 ERROR 帧：0x%02X %s）" % (ec, ename))
+                return got_cmd, got
+            return got_cmd, got
 
 
 # --------------------------------------------------------------------------

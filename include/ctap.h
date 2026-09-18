@@ -41,6 +41,7 @@
 #define CTAP_ERR_UNSUPPORTED_ALGORITHM  0x26
 #define CTAP_ERR_OPERATION_DENIED       0x27
 #define CTAP_ERR_NO_CREDENTIALS         0x2E
+#define CTAP_ERR_KEEPALIVE_CANCEL       0x2D    /* 挂起请求被 CANCEL 取消（CTAP 2.1 §11.4.8）*/
 #define CTAP_ERR_ACTION_TIMEOUT         0x3A    /* 未在超时内取得用户存在 */
 #define CTAP_ERR_OTHER                  0x7F
 
