@@ -64,6 +64,9 @@ extern void Peripheral_PairingModePoll(void);
 /* 客户端有活动时续上配对窗口（避免交互中途配对模式过期） */
 extern void Peripheral_PairingKeepAlive(void);
 
+/* 触发连接参数更新请求（在 CCCD 订阅完成后调用） */
+extern void Peripheral_RequestParamUpdate(void);
+
 /*********************************************************************
 *********************************************************************/
 

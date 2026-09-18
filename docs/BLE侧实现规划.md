@@ -637,15 +637,21 @@ Get-PnpDeviceProperty -InstanceId "BTHLE\DEV_383B267E348E\..."
 | **企业蓝牙策略限制** | `HKLM\SOFTWARE\Policies\Microsoft\Windows\Bluetooth` **为空**，无 MDM/CSP 策略约束配对范围 |
 | **TPM 状态异常** | `Get-Tpm`：`TpmPresent/Ready/Enabled/Activated/Owned` 均为 `True`，`LockedOut=False`。**TPM 完全健康** |
 | **`RestartPending` 导致容器未初始化** | 重启后该标志仍为 `True` —— **它在 TPM 已 Owned 的系统上本就常见，与 FIDO 失败无关**（此项曾被我误判为线索，已纠正）|
+| **设备侧自加事件干扰客户端发现** | 用 `-D BLE_MINIMAL_NO_EXTRA_EVTS` 关掉连接后自启的 `SBP_PERIODIC_EVT`(1.6s)、`SBP_READ_RSSI_EVT`(3.2s) 以及 CCCD 订阅后的主动参数更新，**行为逐行不变**（仍然读完两个特征就停）。这三者只走 HCI 层、不碰 GATT，本就不该干扰 |
 
-**计 14 项，全部排除。**
+**计 17 项，全部排除。**
 
-> 说明：其中"TPM 状态"与"RestartPending"两条来自对 Microsoft Learn
+> 说明一：其中"TPM 状态"与"RestartPending"两条来自对 Microsoft Learn
 > [passkeys 文档](https://learn.microsoft.com/zh-cn/windows/security/identity-protection/passkeys/)
 > 的延伸排查。该文档列出的 "Insert your security key into the USB port"
 > 常见原因（**无 TPM / Windows Hello 未配置 / PC 无蓝牙**）**在本机三条都不成立**，
 > 说明本项目的现象不在该文档覆盖范围内 —— 它属于"**蓝牙 + FIDO2 + 经典 BLE
 > 认证器**"这条组合路径，而这恰是 Windows 支持最弱的一条。
+>
+> 说明二：最后一项（自加事件干扰）是配合当时的代码改动做的**受控实验** ——
+> 那套开关已从代码中移除（`src/peripheral.c` 与 `src/ble_transport.c` 各一处），
+> 但**结论保留在此**，因为它回答了一个后来者很可能会问的问题：
+> "是不是设备侧主动做了某些事，把客户端的发现流程挤掉了？"**答案是否定的。**
 
 #### 已确认为**必要前提**的一点
 
@@ -679,6 +685,118 @@ Get-PnpDeviceProperty -InstanceId "BTHLE\DEV_383B267E348E\..."
 只有 enclave / Windows Hello 的 discovery 列表，推断"浏览器不扫描 BLE"。
 实际上 CtapSrv 是独立服务，不在浏览器进程的 discovery 清单里；
 真正的原因是底层提供程序建不起 FIDO 上下文。）**
+
+#### 补证：设备确实进入了候选池（弹窗类型 + 完整请求日志）
+
+**这一条补上最后一块拼图。** 之前的分析都基于"设备侧看到的交互"，而
+Windows 侧一直只有错误码。以下两点来自 `Microsoft-Windows-WebAuthN/Operational`
+的完整请求日志，**它们一起证明：设备确实被当成了候选认证器，失败发生在之后的建上下文环节。**
+
+**其一：弹窗是"传输型提示"，不是 Windows Hello 的 UI**
+
+**实测确认**：注册时弹出的窗口是
+
+```
+打开蓝牙密钥或将其插入 USB
+```
+
+**这是"传输选择器"的提示，而不是 Windows Hello 的 PIN/指纹输入界面。**
+
+**如果它是 Windows Hello 的 UI**，说明平台认证器被选中、**BLE 设备根本没进候选** ——
+那就完全是另一回事。**而"打开蓝牙密钥"意味着 Windows 正在等一个 BLE 或 USB
+安全密钥，也就是我们的设备确实在候选池里。**
+
+**其二：完整请求日志给出的时序**
+
+`Ctap MakeCredential 已开始` 之后，日志呈现这样的结构（18:47 那一轮）：
+
+```
+Ctap Ble 设备线程已启动     DevicePath: ble:383b267e348e_0021
+                            PairedName: SecureKey
+Ctap Ble 提供程序线程已启动                    <- BLE 传输提供程序被拉起
+Ctap Usb 提供程序线程已开始                     <- 同时并行探测 USB/NFC
+Ctap Nfc 提供程序线程已开始
+
+（约 20 秒内，反复出现）
+  Ctap Ble 函数: _BleCreateContext 位置:
+      错误: 0x80090011. 找不到对象。
+  Ctap Ble 函数: _GetFidoGattService 位置:
+      错误: 0x80090011. 找不到对象。
+  Ctap Ble 函数: _GetFidoGattServiceFromServicesResult 位置:
+      错误: 0x80090011. 找不到对象。
+
+Ctap Ble 设备线程已完成
+  AAGuid: {00000000-0000-0000-0000-000000000000}    <- 仍为全零
+  状态: 3
+  错误: 0x4C7. 操作已被用户取消。                    <- 用户手动取消
+```
+
+**要点**：
+
+- **BLE / USB / NFC 三个提供程序是并行启动的** —— 这是 CtapSrv 的正常策略，
+  USB 与 NFC 的报错（`0x8010001D` 智能卡资源管理器未运行）也属正常
+- **`AAGuid` 全程为全零** —— **一个 CTAP 命令都没发出去**
+- **结束原因是用户手动取消**（`0x4C7`），而非 CTAP 层超时
+  （请求给的是 `TimeoutMilliseconds: 300000`，实际约 20 秒即结束）
+
+**其三：失败码有两种，对应不同阶段**
+
+**对比三轮测试（18:04 / 18:36 / 18:47）**：
+
+| 错误码 | 名称 | 出现阶段 |
+|---|---|---|
+| **`0x80090011`** | **`NTE_NOT_FOUND`** | **服务列表里找不到 FIDO 服务**（建上下文时） |
+| **`0x80070141`** | **`ERROR_DEVICE_NOT_CONNECTED`** | **链路还没建立起来**（`位置: Unreachable`） |
+
+**18:36 那一轮的顺序很说明问题**：
+
+```
+18:36:02  _GetFidoGattService 位置:              0x80070141  无法连接至设备
+18:36:04  _GetFidoGattService 位置: Unreachable  0x80070141
+18:36:04  _GetFidoGattService 位置:              0x800704C7  操作已被取消
+```
+
+**先在"设备连不上"上反复重试，然后整个操作被取消。**
+
+**而设备侧日志恰好对应**：**每次 `link ESTABLISHED` 后很快 `link TERMINATED reason=0x13`** ——
+**Windows 连接、放弃、重连，反复循环。**
+
+> **一个值得留意的细节**：`_GetFidoGattServiceFromServicesResult` 这个名字里带着
+> `FidoGattService`，但返回的却是 **CNG 层的错误码**（`0x80090011` = "容器或密钥未找到"）。
+> **一个"查 GATT 服务"的函数返回加密层错误，这本身就提示它内部可能在查找
+> 与该设备关联的某个 CNG 对象**，而 GATT 只是包装。这与"建不起凭据容器"的
+> 判断一致。
+
+**其四：`GetPluginAuthenticatorList` 暴露了 Windows 的认证器候选来源**
+
+**日志里还有一条之前没注意到信息**：
+
+```
+Ctap GetPluginAuthenticatorList 已完成。
+响应: 0x81A5
+        "name"   "Microsoft Password Manager"
+        "clsId"  ...
+        "aaguid" {7D6FA3E8-2A3B-4C7D-9F4A-8B2E5C9A7F12}
+        "state"  1
+        "publisherDisplayNameFromPackageManager" "Microsoft Corporation"
+```
+
+**这是 Windows 11 24H2+ 的「插件认证器 / Passkey Provider」机制** ——
+**Edge 在注册流程开始时会向 CtapSrv 要一份插件列表，拿到的是微软自己的 Password Manager。**
+
+**所以 Edge 眼里的认证器候选池分三类**：
+
+```
+1. 平台认证器   Windows Hello
+2. 插件认证器   Microsoft Password Manager（Passkey Provider）
+3. 传输提供程序 USB / NFC / BLE        <- 我们的设备属于这一类
+```
+
+**而请求里的 `filterHybridTransport = false`** 说明 **Edge 并没有过滤掉混合传输** ——
+**BLE 这条路径是开放的**（这也解释了它为什么会去拉起 BLE 提供程序）。
+
+**综上所述**：**设备进入了候选池、BLE 提供程序被启动、设备被连接、FIDO 特征被读取，
+然后在建 FIDO 上下文时失败，从此不再发任何 CTAP 命令。**
 
 ### 与之对照的外部记录
 

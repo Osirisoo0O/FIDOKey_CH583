@@ -80,12 +80,15 @@
 #endif
 #define PAIRING_SAMPLE_MS       50      /* 按键采样间隔（节流） */
 
-#define PAIRING_WINDOW_MS       120000  /* 配对模式持续 120 秒（初次进入后）*/
-/* 说明：窗口原本 30 秒，实测太短 —— 从长按到客户端完成"扫描->连接->配对
- * ->特征发现"很容易超过 30 秒，一旦窗口在交互中途过期，客户端会认为
- * "设备退出了配对模式"而就此停止（日志里 pairing window expired 之后
- * 客户端再无任何动作，多次重现）。改为 120 秒，并且只要设备在活动
- * （连接着、有 FIDO 读写）就自动续期。 */
+#define PAIRING_WINDOW_MS       30000   /* 配对模式持续 30 秒 */
+/* 说明：曾改为 120 秒，实测过长，改回 30 秒。
+ *
+ * 但窗口不能太短 —— 从长按到客户端完成"扫描->连接->配对->特征发现"可能
+ * 接近这个上限，窗口若在交互中途过期，客户端会认为"设备退出了配对模式"
+ * 而停止（日志里 pairing window expired 之后再无动作，曾多次重现）。
+ *
+ * 为此只要设备在活动（连接着、有 FIDO 读写）就由
+ * Peripheral_PairingKeepAlive() 自动续期，不依赖窗口本身够长。 */
 
 // Minimum connection interval (units of 1.25ms, 6=7.5ms)
 #define DEFAULT_DESIRED_MIN_CONN_INTERVAL    6
@@ -765,20 +768,48 @@ static void Peripheral_LinkEstablished(gapRoleEvent_t *pEvent)
         Peripheral_PairingKeepAlive();   /* 有连接即续期 */
         /* 通知要发到这个连接上，传输层必须知道句柄 */
         ble_transport_set_conn(event->connectionHandle);
+        PRINT("[BLE] transport conn set to %u\n", event->connectionHandle);
+
+        /* ★ CTAP 2.1 §11.4.3：交换 FIDO 消息**之前**链路必须已加密
+         *   （"...SHALL enforce Security Mode 1, Level 2 ... or Level 3
+         *     ... before any FIDO messages are exchanged"）。
+         *
+         *   本设备对 FIDO 属性设了 GATT_PERMIT_ENCRYPT_*。但只靠"客户端读到
+         *   0x0F 再自觉配对"是不可靠的 —— 实测 Windows 的 FIDO 栈收到
+         *   Insufficient Authentication 后**并不发起配对**，而是直接断开，
+         *   表现为"连上就断、reason=0x13"的循环。
+         *
+         *   因此由**外设侧主动发起安全请求**（LL Security Request）：
+         *     - 已绑定设备：用已有 LTK 直接加密，无人工干预
+         *       （满足 §11.4.6"对已绑定客户端无需用户干预"）
+         *     - 未绑定设备：触发配对流程
+         *   SUCCESS 只表示请求已发出，加密结果由 pairStateCB 回报。 */
+        {
+            bStatus_t sec = GAPBondMgr_PeriSecurityReq(event->connectionHandle);
+            PRINT("[BLE] security request -> %s",
+                  (sec == SUCCESS) ? "sent" : "FAILED");
+            PRINT("%c", 10);
+        }
+
         peripheralConnList.connInterval = event->connInterval;
         peripheralConnList.connSlaveLatency = event->connLatency;
         peripheralConnList.connTimeout = event->connTimeout;
 
         // Set timer for periodic event
         tmos_start_task(Peripheral_TaskID, SBP_PERIODIC_EVT, SBP_PERIODIC_EVT_PERIOD);
-
-        // Set timer for param update event
-        tmos_start_task(Peripheral_TaskID, SBP_PARAM_UPDATE_EVT, SBP_PARAM_UPDATE_DELAY);
+        PRINT("[BLE] started PERIODIC_EVT (1.6s)\n");
 
         // Start read rssi
         tmos_start_task(Peripheral_TaskID, SBP_READ_RSSI_EVT, SBP_READ_RSSI_EVT_PERIOD);
+        PRINT("[BLE] started READ_RSSI_EVT\n");
 
-        PRINT("Conn %x - Int %x \n", event->connectionHandle, event->connInterval);
+        /* 参数更新推迟到客户端完成 GATT 发现和 CCCD 订阅后（FIDO_EVT_STATUS_NOTI_ENABLED 回调中）启动，
+         * 避免与 Windows BLE FIDO 客户端的 GATT 发现时序冲突导致断开（reason=0x13）。 */
+
+        PRINT("Conn %u - Int %u SlaveLat %u Timeout %u",
+              event->connectionHandle, event->connInterval,
+              event->connLatency, event->connTimeout);
+        PRINT("%c", 10);
     }
 }
 
@@ -857,12 +888,35 @@ static void peripheralParamUpdateCB(uint16_t connHandle, uint16_t connInterval,
         peripheralConnList.connSlaveLatency = connSlaveLatency;
         peripheralConnList.connTimeout = connTimeout;
 
-        PRINT("Update %x - Int %x \n", connHandle, connInterval);
+        PRINT("[BLE] param update SUCCESS int=%d latency=%d timeout=%d\n",
+              connInterval, connSlaveLatency, connTimeout);
     }
     else
     {
-        PRINT("ERR..\n");
+        PRINT("[BLE] param update ERR: conn mismatch\n");
     }
+}
+
+/**
+ * @brief 触发连接参数更新请求（由 ble_transport 在 CCCD 订阅后调用）
+ *
+ * 在客户端完成 GATT 发现和 CCCD 订阅后调用，避免与 GATT 操作冲突。
+ */
+void Peripheral_RequestParamUpdate(void)
+{
+    if(peripheralConnList.connHandle == GAP_CONNHANDLE_INIT)
+    {
+        /* 没有活跃连接，忽略 */
+        return;
+    }
+
+    PRINT("[BLE] request param update conn=%d\n", peripheralConnList.connHandle);
+    GAPRole_PeripheralConnParamUpdateReq(peripheralConnList.connHandle,
+                                         DEFAULT_DESIRED_MIN_CONN_INTERVAL,
+                                         DEFAULT_DESIRED_MAX_CONN_INTERVAL,
+                                         DEFAULT_DESIRED_SLAVE_LATENCY,
+                                         DEFAULT_DESIRED_CONN_TIMEOUT,
+                                         Peripheral_TaskID);
 }
 
 /*********************************************************************

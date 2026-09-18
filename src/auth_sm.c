@@ -23,6 +23,7 @@ static auth_wait_t s_state = AUTH_WAIT_NONE;
 static uint32_t    s_deadline = 0;
 static uint32_t    s_last_sample = 0;
 static uint8_t     s_press_cnt = 0;
+static uint32_t    s_granted_at = 0;          /* GRANTED 状态进入时刻（TMOS 时基） */
 
 void auth_sm_init(void)
 {
@@ -69,6 +70,7 @@ void auth_sm_poll(void)
         if(s_press_cnt >= AUTH_UP_DEBOUNCE_CNT)
         {
             s_state = AUTH_WAIT_GRANTED;
+            s_granted_at = TMOS_GetSystemClock();  /* 记录 GRANTED 进入时刻 */
             HalLedBlink(HAL_LED_1, 0, 50, 100);          /* 快闪 5Hz：已取得 UP，处理中 */
             SK_LOG("auth: UP granted");
         }
@@ -87,6 +89,17 @@ void auth_sm_poll(void)
 
 auth_wait_t auth_sm_get(void)
 {
+    /* 授权窗口期：GRANTED 状态保持 AUTH_GRANT_HOLD_MS 后自动清除，
+     * 让两个传输层（USB/BLE）都能观察到。 */
+    if(s_state == AUTH_WAIT_GRANTED)
+    {
+        uint32_t now = TMOS_GetSystemClock();
+        if((uint32_t)(now - s_granted_at) >= AUTH_GRANT_HOLD_MS)
+        {
+            s_state = AUTH_WAIT_NONE;
+            s_granted_at = 0;
+        }
+    }
     return s_state;
 }
 

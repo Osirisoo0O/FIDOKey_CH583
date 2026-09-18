@@ -110,11 +110,12 @@ static uint8_t   s_signbuf[AUTHDATA_MAX + COSE_HASH_LEN];
  *
  * @brief   authenticatorGetInfo 的 CBOR 响应
  *
- *   map(4)
+ *   map(5)
  *     1: ["FIDO_2_0"]
  *     3: h'aaguid(16)'
  *     4: { "up": true }
  *     5: 1200
+ *     6: ["usb", "ble"]
  *
  * @note    刻意不声明 rk / clientPin / pinUvAuthProtocols：
  *          可驻留凭证与 PIN 尚未实现，一旦声明主机就会发起不支持的操作。
@@ -123,7 +124,7 @@ static uint16_t ctap_build_get_info(uint8_t *buf, uint16_t buf_max)
 {
     uint32_t o;
 
-    o = cbor_put_map_head(buf, buf_max, 0, 4);
+    o = cbor_put_map_head(buf, buf_max, 0, 5);
     if(o == CBOR_ENC_ERR) { return 0; }
 
     o = cbor_put_uint(buf, buf_max, o, 1);                  /* 1: versions */
@@ -143,6 +144,13 @@ static uint16_t ctap_build_get_info(uint8_t *buf, uint16_t buf_max)
 
     o = cbor_put_uint(buf, buf_max, o, 5);                  /* 5: maxMsgSize */
     o = cbor_put_uint(buf, buf_max, o, CTAP_MAX_MSG_SIZE);
+    if(o == CBOR_ENC_ERR) { return 0; }
+
+    o = cbor_put_uint(buf, buf_max, o, 6);                  /* 6: transports */
+    o = cbor_put_array_head(buf, buf_max, o, 2);
+    o = cbor_put_text(buf, buf_max, o, "usb", 3);
+    if(o == CBOR_ENC_ERR) { return 0; }
+    o = cbor_put_text(buf, buf_max, o, "ble", 3);
     if(o == CBOR_ENC_ERR) { return 0; }
 
     return (uint16_t)o;

@@ -27,6 +27,13 @@
  * "连续 N 次确认"实际上等价于一次采样，起不到任何消抖作用。 */
 #define AUTH_UP_SAMPLE_MS       20
 
+/* 授权窗口期（毫秒）：用户按键后，GRANTED 状态保持这段时间，
+ * 让两个传输层（USB/BLE）都能观察到。
+ * 语义：用户在场是全局事实，不是某个传输层独占的资源。
+ * 100ms 足够两个 poll 调用都能看到 GRANTED，又不会太长导致
+ * 两个操作被意外授权（若要求每次操作独立确认，可选方案A3）。 */
+#define AUTH_GRANT_HOLD_MS      100
+
 typedef enum
 {
     AUTH_WAIT_NONE = 0,     /* 没有在等待 */

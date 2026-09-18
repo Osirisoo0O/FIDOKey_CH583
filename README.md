@@ -331,6 +331,21 @@ passed 5/5
       **Windows 自带的 FIDO 管理界面同样卡在"打开蓝牙密钥或者插入 USB"**，
       而它与 Edge 共用同一套 `webauthn.dll`；`bleak` 之所以能通，
       正因为它**绕过** `webauthn.dll` 直连 WinRT BLE API
+    - **设备确实进入了候选池**（弹窗与完整请求日志补证）：
+      - **弹窗是"传输选择器"的提示（"打开蓝牙密钥或将其插入 USB"），
+        不是 Windows Hello 的 PIN/指纹界面** —— 后者意味着平台认证器被选中、
+        BLE 设备根本没进候选；而前者说明它在**等一个 BLE/USB 安全密钥**
+      - **CtapSrv 并行拉起 BLE / USB / NFC 三个提供程序**，
+        `DevicePath: ble:383b267e348e_0021`、`PairedName: SecureKey` 都正常
+      - **请求里的 `filterHybridTransport = false`** —— Edge 并未过滤混合传输，
+        BLE 路径是开放的
+      - **`GetPluginAuthenticatorList` 返回 "Microsoft Password Manager"** ——
+        Win11 24H2+ 的插件认证器机制；候选池实为
+        **平台（Hello）+ 插件（Password Manager）+ 传输提供程序（USB/NFC/BLE）** 三类
+      - 失败码有两种：**`0x80090011`（NTE_NOT_FOUND，服务列表里找不到 FIDO 服务）**
+        与 **`0x80070141`（ERROR_DEVICE_NOT_CONNECTED，链路未建立，位置 `Unreachable`）**
+      - 整个流程约 20 秒后由**用户取消**（`0x4C7`），而非 CTAP 层超时
+        （请求给的是 `TimeoutMilliseconds: 300000`）
   - **Android** 系统**显式限制**第三方访问 FIDO GATT 服务（`isFidoSrvcUuid`）
   - **Chrome 自带的 BLE 认证器支持已于 2020 年移除**，业界转向 caBLE
   - 外部记录一致：**Mozilla Bug 1768622**（"只提示插入 USB"）、Windows 11
@@ -354,12 +369,15 @@ passed 5/5
     无企业蓝牙策略（`HKLM\...\Bluetooth` 为空）、`Get-Tpm` 各项均 `True`。
     **该文档列出的 USB 提示常见原因（无 TPM / Hello 未配置 / PC 无蓝牙）
     在本机三条都不成立** —— 说明本项目的现象不在其覆盖范围内。
+  - **设备侧自加事件也不干扰客户端发现**：用受控实验关掉连接后自启的
+    `SBP_PERIODIC_EVT` / `SBP_READ_RSSI_EVT` 与 CCCD 订阅后的主动参数更新，
+    **行为逐行不变**（它们只走 HCI 层，不碰 GATT）
 
   **结论：根因在平台侧，非本项目实现缺陷。**
   需要在真实客户端上验证时，建议走 **Linux + `fido2ble`**
   （把 BLE FIDO 桥接成 USB HID，绕开平台限制），
   或用 **FIDO Conformance Tool** 验证设备合规性。
-  完整的排查过程（**含已排除的 14 个假设**、Windows 侧三层证据链、
+  完整的排查过程（**含已排除的 17 个假设**、Windows 侧三层证据链、
   `webauthn.dll` 内部机制调研）见
   [BLE 侧实现规划 §客户端兼容性的根因](docs/BLE侧实现规划.md)
 - **`up=false` 的探测请求会直接放行**：不做用户确认（符合浏览器自动填充探测的需求）
