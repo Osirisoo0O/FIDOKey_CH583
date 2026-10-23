@@ -1,6 +1,6 @@
 /********************************** (C) COPYRIGHT *******************************
  * File Name          : SecureKey_CH58x.ld
- * Description        : SecureKey_WCH 专用链接脚本（基于官方 Link_CH58x.ld）
+ * Description        : FIDOKey_CH583 专用链接脚本（基于官方 Link_CH58x.ld）
  *
  * CH583 片内 Flash 共计 480KB：
  *   0x00000 - 0x6FFFF   Code Flash   448KB   ← 本脚本负责（FLASH 区域）

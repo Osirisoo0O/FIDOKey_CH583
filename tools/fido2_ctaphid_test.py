@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SecureKey_WCH 真机测试 —— 底层 CTAPHID 命令与 GetInfo（对应测试清单 T2 / T3）
+FIDOKey_CH583 真机测试 —— 底层 CTAPHID 命令与 GetInfo（对应测试清单 T2 / T3）
 
 用法:
     pip install fido2

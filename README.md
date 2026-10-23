@@ -1,4 +1,4 @@
-# SecureKey_WCH
+# FIDOKey_CH583
 
 基于 **WCH CH583**（RISC-V 青稞 V4，RV32IMAC）实现的 **FIDO2 / WebAuthn 安全密钥**。
 

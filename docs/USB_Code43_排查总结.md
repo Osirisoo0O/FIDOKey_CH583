@@ -1,4 +1,4 @@
-# SecureKey_WCH — USB 代码 43 问题排查与修复总结
+# FIDOKey_CH583 — USB 代码 43 问题排查与修复总结
 
 > 项目：基于 CH583 的 FIDO2 安全密钥（BLE + USB 双模，USB 侧为 CTAPHID/HID）
 > 本文件记录 USB 设备枚举报 **代码 43 / "请求 USB 设备描述符失败"** 的完整排查过程与最终修复（承接 `USB_Code45_排查总结.md`）。

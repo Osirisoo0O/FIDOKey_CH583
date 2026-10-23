@@ -1,4 +1,4 @@
-# SecureKey_WCH — USB Code45 问题排查总结
+# FIDOKey_CH583 — USB Code45 问题排查总结
 
 > 项目：基于 CH583 的 FIDO2 安全密钥（BLE + USB 双模）
 > 本文件记录 USB 设备枚举报 **代码 45** 的完整排查过程与最终结论（2025 会话记录）。

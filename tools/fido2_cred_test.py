@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SecureKey_WCH 真机测试 —— 注册与登录（对应测试清单 T4 / T5 / 超时）
+FIDOKey_CH583 真机测试 —— 注册与登录（对应测试清单 T4 / T5 / 超时）
 
 用法:
     pip install fido2

@@ -1,7 +1,7 @@
 {
     "name": "micro-ecc",
     "version": "1.0.0",
-    "description": "ECDSA P-256 (secp256r1) for SecureKey_WCH. Fork of kmackay/micro-ecc @ 541b3a78026420a3e369c4c9281c396b5e531113 (BSD-2-Clause). RISC-V uses the C-only path; no source modifications.",
+    "description": "ECDSA P-256 (secp256r1) for FIDOKey_CH583. Fork of kmackay/micro-ecc @ 541b3a78026420a3e369c4c9281c396b5e531113 (BSD-2-Clause). RISC-V uses the C-only path; no source modifications.",
     "keywords": "ecdsa, p256, secp256r1, crypto",
     "license": "BSD-2-Clause",
     "build": {
