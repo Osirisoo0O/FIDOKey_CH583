@@ -134,13 +134,6 @@ void ble_transport_pending_poll(void);
  */
 uint16_t ble_transport_max_frame(void);
 
-/**
- * @brief 客户端完成 CCCD 订阅后触发参数更新（由 fido_service 回调转来）
- *
- * 在 FIDO_EVT_STATUS_NOTI_ENABLED 事件中调用，此时客户端已完成
- * GATT 发现和 CCCD 订阅，参数更新不会干扰 GATT 操作。
- */
-void ble_transport_on_cccd_enabled(void);
 
 #ifdef __cplusplus
 }

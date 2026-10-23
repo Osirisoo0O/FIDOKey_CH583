@@ -136,18 +136,6 @@ void ble_transport_set_mtu(uint16_t mtu)
     }
 }
 
-/**
- * @brief 客户端完成 CCCD 订阅后触发参数更新
- *
- * 在 FIDO_EVT_STATUS_NOTI_ENABLED 回调中调用，此时客户端已完成
- * GATT 发现和 CCCD 订阅，参数更新不会干扰 GATT 操作。
- */
-void ble_transport_on_cccd_enabled(void)
-{
-    /* 调用 peripheral.c 的参数更新入口 */
-    extern void Peripheral_RequestParamUpdate(void);
-    Peripheral_RequestParamUpdate();
-}
 
 /**
  * @brief 单次通知能承载的最大字节数 = ATT_MTU - 3（ATT 层的 3 字节头）
@@ -285,8 +273,6 @@ static void ble_transport_event_cb(fido_evt_t *p_evt)
         case FIDO_EVT_STATUS_NOTI_ENABLED:
             /* 记下订阅的连接，通知要发到同一个连接上 */
             s_conn = p_evt->connHandle;
-            /* 客户端已完成 GATT 发现和 CCCD 订阅，此时触发参数更新是安全的 */
-            ble_transport_on_cccd_enabled();
             break;
 
         case FIDO_EVT_STATUS_NOTI_DISABLED:

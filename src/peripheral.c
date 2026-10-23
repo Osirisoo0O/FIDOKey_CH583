@@ -20,6 +20,7 @@
 #include "auth_sm.h"  /* auth_sm_get()：判断当前是否在等 UP */
 #include "LED.h"      /* 配对模式的 LED 提示 */
 #include "fido_service.h"
+#include "dbg_service.h"   /* 调试服务：写 0x01 清除 BLE 绑定 */
 #include "ble_transport.h"
 #include "app_usb.h"
 
@@ -190,9 +191,8 @@ static uint8_t advertData[] = {
     // （WCH 栈不用 BLE 规范的分段反序，见 fido_service.c 的说明）。
     0x11,                      // length: 1(type) + 16(uuid)
     GAP_ADTYPE_128BIT_COMPLETE,
-    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
-    0x00, 0x10, 0x00, 0x00, 0xfd, 0xff, 0x00, 0x00,
-
+    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 0xfd, 0xff, 0x00, 0x00,
+    //0xff, 0xfd, 0x00, 0x00,0x00, 0x00, 0x00, 0x10,0x80, 0x00, 0x00, 0x80, 0x5f, 0x9b, 0x34, 0xfb,
     // ---- FIDO Service Data（配对模式标志）----
     // CTAP 2.1 规范 §11.4.7 "Authenticator Advertising Format"：
     //   "Some client platforms (most notably iOS) do not expose the AD Flag
@@ -240,6 +240,17 @@ static uint32_t s_key_hold_start = 0;   /* 按住起点；0 = 未按住 */
  */
 #define ADVERT_FLAGS_OFFSET     2
 #define ADVERT_SD_FLAGS_OFFSET  25
+
+/* 关于 Service Data 的 bit7（CTAP 2.1 §11.4.13.2）：
+ *   "bit7 = Device is in pairing mode"
+ *
+ * 语义严格按规范 —— **只**反映配对模式，与是否有连接无关：
+ *     配对模式 ON  -> 0x80
+ *     配对模式 OFF -> 0x00
+ * 由 Peripheral_SetPairingMode() 直接改写（见该函数）。
+ *
+ * 曾一度让它 = "配对模式 或 已连接"（当时怀疑客户端连上后重新扫描时
+ * 读到 0x00 会以为设备不可用）。但那偏离了规范的语义，已回到严格实现。 */
 
 // GAP GATT Attributes —— 设备名（GAP 服务的 0x2A00 特征）
 //
@@ -302,9 +313,13 @@ static void Peripheral_SetPairingMode(uint8_t on)
     }
     s_pairing_mode = on;
 
-    /* 1) Service Data 里的 FIDO 标志字节：bit7 = 处于配对模式。
-     *    这是客户端（iOS/Android）判断设备能否配对的主要依据 ——
-     *    规范指出平台通常不向应用暴露 AD Flags 的 Discoverable 位。 */
+    /* 1) Service Data 的 bit7（CTAP 2.1 §11.4.13.2：bit7 = "Device is in
+     *    pairing mode"）。严格按语义来 —— **只**反映配对模式，与是否有
+     *    连接无关：
+     *        配对模式 ON  -> 0x80
+     *        配对模式 OFF -> 0x00
+     *    这是客户端判断"设备能否配对"的主要依据（规范指出平台通常不向
+     *    应用暴露 AD Flags 的 Discoverable 位，只能靠 Service Data）。 */
     advertData[ADVERT_SD_FLAGS_OFFSET] =
         on ? FIDO_SD_BIT_PAIRING_MODE : 0x00;
     GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(advertData), advertData);
@@ -333,6 +348,15 @@ static void Peripheral_SetPairingMode(uint8_t on)
     }
 
     PRINT("[BLE] pairing mode %s", on ? "ON (long-press detected)" : "OFF");
+    PRINT("%c", 10);
+
+    /* 无条件打印广播的实际内容，作为"是否真的生效"的凭据
+     * （只看 PRINT 里的意图值不够 —— 必须看数组里的实际字节）。
+     *   AD flags：配对模式=0x06(GENERAL|BREDR_NOT_SUPPORTED)、非配对=0x04
+     *   svc bit7：配对模式=0x80、非配对=0x00 */
+    PRINT("[BLE]   AD flags=0x%02X  svc bit7=0x%02X  (pairing=%u)",
+          advertData[ADVERT_FLAGS_OFFSET], advertData[ADVERT_SD_FLAGS_OFFSET],
+          s_pairing_mode);
     PRINT("%c", 10);
 }
 
@@ -559,6 +583,11 @@ void Peripheral_Init()
      * 两者都不是规范要求，且在服务发现时会多出无关条目，故移除。 */
     ble_transport_init();
 
+    /* 调试服务（f0000001-…）：写 0x01 即清除所有 BLE 绑定。
+     * 省去"改 -D BLE_ERASE_BONDS_ON_BOOT 宏 -> 重烧 -> 上电"的循环。
+     * 发布前可整段移除（连同 src/dbg_service.c / include/dbg_service.h）。 */
+    dbg_add_service();
+
     // Init Connection Item
     peripheralInitConnItem(&peripheralConnList);
 
@@ -770,26 +799,24 @@ static void Peripheral_LinkEstablished(gapRoleEvent_t *pEvent)
         ble_transport_set_conn(event->connectionHandle);
         PRINT("[BLE] transport conn set to %u\n", event->connectionHandle);
 
-        /* ★ CTAP 2.1 §11.4.3：交换 FIDO 消息**之前**链路必须已加密
-         *   （"...SHALL enforce Security Mode 1, Level 2 ... or Level 3
-         *     ... before any FIDO messages are exchanged"）。
+        /* 关于链路加密（CTAP 2.1 §11.4.3）：
+         *   "the authenticator SHALL enforce Security Mode 1, Level 2 ... or
+         *    Level 3 ... before any FIDO messages are exchanged"
          *
-         *   本设备对 FIDO 属性设了 GATT_PERMIT_ENCRYPT_*。但只靠"客户端读到
-         *   0x0F 再自觉配对"是不可靠的 —— 实测 Windows 的 FIDO 栈收到
-         *   Insufficient Authentication 后**并不发起配对**，而是直接断开，
-         *   表现为"连上就断、reason=0x13"的循环。
+         * 本设备靠 GATT_PERMIT_ENCRYPT_* 满足这一条 —— 未加密的连接读写
+         * FIDO 属性会被拒（实测 ATT 5 Insufficient Authentication），
+         * 从"拒绝明文访问"的角度强制了加密。
          *
-         *   因此由**外设侧主动发起安全请求**（LL Security Request）：
-         *     - 已绑定设备：用已有 LTK 直接加密，无人工干预
-         *       （满足 §11.4.6"对已绑定客户端无需用户干预"）
-         *     - 未绑定设备：触发配对流程
-         *   SUCCESS 只表示请求已发出，加密结果由 pairStateCB 回报。 */
-        {
-            bStatus_t sec = GAPBondMgr_PeriSecurityReq(event->connectionHandle);
-            PRINT("[BLE] security request -> %s",
-                  (sec == SUCCESS) ? "sent" : "FAILED");
-            PRINT("%c", 10);
-        }
+         * ★ 曾在此处调用 GAPBondMgr_PeriSecurityReq() 由外设主动发
+         *   LL Security Request，**实测效果是负面的**：
+         *     - 有它：连接后**立刻**断开（reason=0x13），连 mtu exchange
+         *       都来不及做，约 30 次循环无一成功
+         *     - 去掉后：连接稳定，能完成 mtu exchange 与特征读取
+         *   原因是它把"客户端自己决定何时加密"变成"设备强迫立即加密"，
+         *   客户端不接受这个节奏就直接放弃连接。
+         *   规范并未要求由哪一侧发起加密，故不再主动发请求，
+         *   改为"客户端发起 + 权限位兜底"。
+         */
 
         peripheralConnList.connInterval = event->connInterval;
         peripheralConnList.connSlaveLatency = event->connLatency;
@@ -799,12 +826,12 @@ static void Peripheral_LinkEstablished(gapRoleEvent_t *pEvent)
         tmos_start_task(Peripheral_TaskID, SBP_PERIODIC_EVT, SBP_PERIODIC_EVT_PERIOD);
         PRINT("[BLE] started PERIODIC_EVT (1.6s)\n");
 
+        // Set timer for param update event
+        tmos_start_task(Peripheral_TaskID, SBP_PARAM_UPDATE_EVT, SBP_PARAM_UPDATE_DELAY);
+
         // Start read rssi
         tmos_start_task(Peripheral_TaskID, SBP_READ_RSSI_EVT, SBP_READ_RSSI_EVT_PERIOD);
         PRINT("[BLE] started READ_RSSI_EVT\n");
-
-        /* 参数更新推迟到客户端完成 GATT 发现和 CCCD 订阅后（FIDO_EVT_STATUS_NOTI_ENABLED 回调中）启动，
-         * 避免与 Windows BLE FIDO 客户端的 GATT 发现时序冲突导致断开（reason=0x13）。 */
 
         PRINT("Conn %u - Int %u SlaveLat %u Timeout %u",
               event->connectionHandle, event->connInterval,
@@ -897,27 +924,6 @@ static void peripheralParamUpdateCB(uint16_t connHandle, uint16_t connInterval,
     }
 }
 
-/**
- * @brief 触发连接参数更新请求（由 ble_transport 在 CCCD 订阅后调用）
- *
- * 在客户端完成 GATT 发现和 CCCD 订阅后调用，避免与 GATT 操作冲突。
- */
-void Peripheral_RequestParamUpdate(void)
-{
-    if(peripheralConnList.connHandle == GAP_CONNHANDLE_INIT)
-    {
-        /* 没有活跃连接，忽略 */
-        return;
-    }
-
-    PRINT("[BLE] request param update conn=%d\n", peripheralConnList.connHandle);
-    GAPRole_PeripheralConnParamUpdateReq(peripheralConnList.connHandle,
-                                         DEFAULT_DESIRED_MIN_CONN_INTERVAL,
-                                         DEFAULT_DESIRED_MAX_CONN_INTERVAL,
-                                         DEFAULT_DESIRED_SLAVE_LATENCY,
-                                         DEFAULT_DESIRED_CONN_TIMEOUT,
-                                         Peripheral_TaskID);
-}
 
 /*********************************************************************
  * @fn      peripheralStateNotificationCB

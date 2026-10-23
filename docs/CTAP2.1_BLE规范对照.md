@@ -456,14 +456,21 @@ uint8_t pairMode = GAPBOND_PAIRING_MODE_WAIT_FOR_REQ;
 > **服务声明与特征声明刻意不加加密位**：客户端必须先做服务发现才知道有这些
 > 特征，加密前就把它们挡住会让客户端根本找不到服务。
 >
-> **为什么靠权限位就够了、不必显式发起加密**：未加密的连接读写这些属性会得到
-> `ATT_ERR_INSUFFICIENT_ENCRYPTION (0x0F)`，Windows/Android 的 BLE 栈收到该错误会
-> **自动发起配对/加密**后再重试。这正是规范期望的强制时机，且已绑定设备可
-> 无人工干预完成（满足 §11.4.6 的"对已绑定客户端必须无干预放行"）。
+> **为什么只用权限位、不主动发起加密**：未加密的连接读写这些属性会得到
+> `ATT_ERR_INSUFFICIENT_AUTHENTICATION`（实测该栈返回的是 ATT 错误码 **5**，
+> 语义同规范文档常见的 `0x0F`），客户端据此自行发起配对/加密。
+> 这正是规范期望的强制时机，且已绑定设备可无人工干预完成
+> （满足 §11.4.6 的"对已绑定客户端必须无干预放行"）。
 >
-> **待实测确认**：改完后必须重测**首次配对**（先删除配对记录）与**重连**两条路径，
-> 确认不会出现"连上就卡住"。若某些平台不主动发起加密，再考虑在
-> `Peripheral_LinkEstablished()` 里补显式加密流程。
+> **实测结论（两轮对照，详见第八节 8.1）**：
+> - **只用权限位** → 连接稳定，能 `mtu exchange`、能读特征；
+>   且**实测到 Windows 自己发起配对**（`pair state=0/1/3 → bond saved`），
+>   **设备侧没有发任何安全请求**。
+> - 曾额外加 `GAPBondMgr_PeriSecurityReq()` 主动发 `LL Security Request` →
+>   **连接后立刻断**（`reason=0x13`），约 30~60 次循环无一成功。
+>   **已移除**，规范也未要求由哪一侧发起加密。
+>
+> **结论**：靠权限位兜底 + 客户端自发配对即可，**不需要设备主动要求加密**。
 
 
 ### §11.4.14 命令完成后的连接保持
@@ -917,3 +924,190 @@ Windows 的 FIDO 实现可能因设备**同时**声明 USB 而走不同分支
 
 两者均已修正（跳过 KEEPALIVE、解析 ERROR 错误码）。
 `ble_ctap2_conformance.py` 原本处理正确，是 `ble_gatt_client.py` 漏了。
+
+---
+
+## 七、GATT 属性表顺序调整与诊断脚本
+
+### 7.1 `s_ProfileAttrTbl` 顺序调整（`src/fido_service.c`）
+
+**调整内容**：把 `fidoControlPointLength` 与 `fidoServiceRevisionBitfield`
+的位置对调，**让 CPLength 的 handle 更小**。
+
+| 属性表下标 | 调整前 | 调整后 |
+|---|---|---|
+| `[0]` | Service 声明 | Service 声明 |
+| `[1]` `[2]` | `fidoControlPoint` 声明/值 | 同 |
+| `[3]` `[4]` `[5]` | `fidoStatus` 声明/值/CCCD | 同 |
+| `[6]` `[7]` | **`fidoServiceRevisionBitfield`** 声明/值 | **`fidoControlPointLength`** 声明/值 |
+| `[8]` `[9]` | **`fidoControlPointLength`** 声明/值 | **`fidoServiceRevisionBitfield`** 声明/值 |
+
+**索引宏同步**：
+
+```c
+#define ATTR_IDX_CP_LENGTH_VALUE        7      /* 原 9 */
+#define ATTR_IDX_REV_BITFIELD_VALUE     9      /* 原 7 */
+```
+
+**为什么来回调**：规范 §11.4.6 的流程是"**先**检查 Bitfield 并写入版本位，
+**再**读 CPLength"，曾据此把 Bitfield 排到前面。但实测 Windows FIDO 栈
+**并不按规范流程走** —— 它按 handle 顺序遍历，而且**读到一个特征后仍会继续**
+（不再出现"读完 CPLength 就停"）。故回到 CPLength 在前。
+
+**风险点**：`ATTR_IDX_*` 与属性表**是手工同步的**，改错时**编译不会报错**，
+只会在运行时读写到错误的 handle。本次调整后已 `pio run` 通过，
+且头部注释里的下标表（`[0]`–`[9]`）与两个宏一致。
+
+### 7.2 新增两个诊断脚本（`tools/`）
+
+| 脚本 | 用途 | 依赖 |
+|---|---|---|
+| `newtest.py` | 用 bleak 直连设备转储 GATT，判断 `_GetFidoGattService Unreachable` 是**设备问题**还是 **Windows 栈问题** | `bleak` |
+| `fido_diagnose.py` | 检查 Windows 侧的 CTAP BLE 连接、GATT 服务、**系统服务**、**事件日志**、注册状态 | `bleak wmi pywin32`，需**管理员** |
+
+**方向**：此前几轮排查都是"从设备侧看"（串口日志），这两个脚本补上了
+**"从 Windows 侧取证"**，正好对上第六节里悬空的问题（客户端为何停在第 5 步）。
+
+### 7.3 本轮修掉的两个缺陷
+
+**① `fido_service.c` 的行内 `idx` 标签与注释过时**（已修）
+
+顺序调整后，属性表里的 `/* idx N */` 标签仍是旧值，注释也还在论证
+"Bitfield 放在 CPLength 之前"。**编译不受影响，但会误导后续维护。**
+
+修正后：`fidoStatus` → `idx 4`、CCCD → `idx 5`、CPLength → `idx 7`、
+Bitfield → `idx 9`；并把"顺序调整过两轮"的来龙去脉写进 Bitfield 的注释。
+
+**② `newtest.py` 的特征 UUID 全部错误**（已修）
+
+```python
+# 修改前（错的 —— 这是"U2F 猜测值"，不是本设备的 UUID）
+"0000fff1-0000-1000-8000-00805f9b34fb": "U2F Control Point"
+...
+# 修改后（设备实际值，与 fido_service.h / GATT dump 一致）
+"f1d0fff1-deaa-ecee-b42f-c9ba7ed623bb": "fidoControlPoint"
+...
+```
+
+**服务 UUID `0000fffd-…` 是对的**（BLE 规范分配给 FIDO 的短 UUID），
+但**四个特征用的是厂商定义的 `F1D0FFFx-DEAA-ECEE-B42F-C9BA7ED623BB`**，
+前缀是 `f1d0` 而非 `0000`。改前该脚本能发现 FIDO 服务却认不出任何特征，
+4 个特征会全部显示"未找到"。
+
+---
+
+## 八、链路加密的最终方案、Service Data 收敛与调试服务
+
+### 8.1 链路加密（§11.4.3）：改为"客户端发起 + 权限位兜底"
+
+**最终实现**：**不**由设备主动发安全请求，只保留 `GATT_PERMIT_ENCRYPT_*`。
+
+**演进过程（两轮实测对照）**：
+
+| 配置 | 连接行为 | 结论 |
+|---|---|---|
+| 只有权限位，不主动发请求 | 连接稳定、能 `mtu exchange`、能读特征 | ✅ **采用** |
+| 权限位 + `GAPBondMgr_PeriSecurityReq()` | **连接后立刻断**（`reason=0x13`），约 30~60 次循环无一成功 | ❌ **已移除** |
+
+**为什么主动发请求会坏事**：BLE 的 `LL Security Request` 是
+Peripheral → Central 的"请立即启动加密"指令。它把"客户端自己决定何时加密"
+变成"设备强迫立即加密"，客户端不接受这个节奏就直接放弃连接
+（连 `mtu exchange` 都来不及做）。
+
+**规范并未规定由哪一侧发起加密**（§11.4.2 只要求"必须用 LTK + 全程加密"），
+所以不主动发请求**不违规**。
+
+**关键实测结论：Windows 会自己发起配对。** 在一次两端 bond 状态干净的会话中，
+日志出现了完整的 `mtu exchange: 256` → `pair state=0/1/3` → `bond saved`，
+**期间设备侧没有发任何安全请求**。
+
+### 8.2 Service Data bit7：回到"只反映配对模式"
+
+**最终实现**（§11.4.13.2）：bit7 严格等于"设备处于配对模式"，
+**与是否有连接无关**。
+
+```c
+advertData[ADVERT_SD_FLAGS_OFFSET] = on ? FIDO_SD_BIT_PAIRING_MODE : 0x00;
+```
+
+**曾偏离过**：一段时间内让它 = "配对模式 **或** 已连接"，理由是
+"客户端连上后重新扫描读到 0x00 会以为设备不可用"。该假设未被证实，
+且偏离了规范语义，已改回。
+
+**顺带加了一条无条件诊断日志**（每次配对模式切换都打印广播的实际字节）：
+
+```
+[BLE] pairing mode ON (long-press detected)
+[BLE]   AD flags=0x06  svc bit7=0x80  (pairing=1)
+```
+
+**为什么必须"无条件"打印**：早期用的是"只在值变化时打印"，于是"没打印"
+既可能是"没变化"也可能是"没执行" —— 排查时被这一点卡住过。
+这两行直接来自 `advertData[]` 数组，是**真实字节**而非意图值。
+
+**参照值**：
+
+| 状态 | AD flags | svc bit7 |
+|---|---|---|
+| 非配对模式 | `0x04` | `0x00` |
+| 配对模式 | `0x06` | `0x80` |
+
+### 8.3 调试服务：写一个特征即清空 BLE 绑定
+
+**动机**：调试配对流程时常需"把两侧配对记录彻底重置"。原本只能打开
+`-D BLE_ERASE_BONDS_ON_BOOT`、重烧固件、上电，一轮几十秒，而且清完
+还得再烧回去（否则留不住 bond）。**现在变成一次 GATT 写入。**
+
+**新增文件**：`include/dbg_service.h`、`src/dbg_service.c`
+（注册于 `src/peripheral.c` 的 `ble_transport_init()` 之后）
+
+| 项 | 值 |
+|---|---|
+| 服务 UUID | `f0000001-0000-1000-8000-00805f9b34fb` |
+| 特征 UUID | `f0000002-0000-1000-8000-00805f9b34fb` |
+| 属性 | `WRITE` + **`ENCRYPT_WRITE`** |
+| 行为 | 写入 `0x01` → `GAPBondMgr_SetParameter(GAPBOND_ERASE_ALLBONDS, 0, NULL)` |
+
+**两个设计选择**：
+
+1. **写权限要求加密** —— 否则任何未配对设备都能清空绑定，是个拒绝服务后门。
+2. **用自定义 128-bit UUID**（`f0000001` / `f0000002`），不占 16-bit 号段，
+   不与规范冲突。存放形式沿用本项目约定：**16 字节整体反序**。
+
+**用法**：nRF Connect 连接 → 找到服务 `f0000001-…` → 向特征写 `0x01`
+→ 串口打印 `[DBG] ERASE ALL BONDS` → **主机侧也删除配对记录** → 重新配对。
+
+**⚠️ 发布前移除**：删掉 `peripheral.c` 里那一行 `dbg_add_service();`
+（连同两个文件）。
+
+### 8.4 关于"连接后立刻断"的观察（未完全定论）
+
+**现象**：`link ESTABLISHED` 后**没有** `mtu exchange` 就 `reason=0x13` 断开，
+约 30~60 次循环。**该现象时有时无** —— 同样的操作、同一固件，
+有一次完整走通了（配对 + 读特征 + 连接保持数十秒）。
+
+**目前最可能的解释**：**两端 bond（LTK）不一致**，客户端发起加密失败后放弃。
+支持这一点的观察是：断开发生在 **MTU 协商之前**，即安全层而非 GATT 层。
+
+**缓解手段**：用 8.3 的调试服务（或 `-D BLE_ERASE_BONDS_ON_BOOT`）
+把**设备侧与主机侧的配对记录同时清零**，再重新配对。
+
+**若清 bond 后仍循环断开**，需转向主机侧取证 —— `tools/fido_diagnose.py`
+正是为此准备的（查事件日志、系统服务、注册状态）。
+
+### 8.5 客户端读特征的顺序（修正一处与实测相反的注释）
+
+实测日志：
+
+```
+[FIDO] read  h=0x002A -> 20 (RevisionBitfield, FIDO2=0x20)   ← 先读 handle 大的
+[FIDO] read  h=0x0028 -> FD 00 (CPLength)                    ← 再读 handle 小的
+```
+
+**客户端按 handle 降序读**，而 `fido_service.c` 的注释此前写的是
+"客户端按 handle 升序遍历" —— 该注释已随 7.1 的顺序调整一并更新。
+
+**另外**：客户端读过 `fidoServiceRevisionBitfield` 之后**没有写入**它，
+而 §11.4.5.1 用 **SHALL** 要求"发任何 FIDO 命令前必须先写入恰好 1 bit"。
+**这是客户端违反规范**，不是设备问题（对照 `ble_gatt_client.py`
+老老实实写了 `0x20`，之后就能正常发 MakeCredential）。

@@ -44,8 +44,8 @@
  */
 #define ATTR_IDX_CONTROL_POINT_VALUE    2
 #define ATTR_IDX_STATUS_VALUE           4
-#define ATTR_IDX_CP_LENGTH_VALUE        9
-#define ATTR_IDX_REV_BITFIELD_VALUE     7
+#define ATTR_IDX_CP_LENGTH_VALUE        7
+#define ATTR_IDX_REV_BITFIELD_VALUE     9
 
 /*********************************************************************
  * GLOBAL VARIABLES
@@ -176,38 +176,17 @@ static gattAttribute_t s_ProfileAttrTbl[] = {
         &s_StatusProps
     },
     {
-        {ATT_UUID_SIZE, fido_StatusUUID},            /* idx 5 */
+        {ATT_UUID_SIZE, fido_StatusUUID},            /* idx 4 */
         0,
         0,
         &s_StatusValue
     },
     {
-        {ATT_BT_UUID_SIZE, clientCharCfgUUID},       /* idx 6: CCCD */
+        {ATT_BT_UUID_SIZE, clientCharCfgUUID},       /* idx 5: CCCD */
         GATT_PERMIT_READ | GATT_PERMIT_WRITE |
             GATT_PERMIT_ENCRYPT_READ | GATT_PERMIT_ENCRYPT_WRITE,
         0,
         (uint8_t *)s_StatusCCCD
-    },
-
-    /* ---- 特征 4: fidoServiceRevisionBitfield (Read/Write) ----
-     *
-     * 放在 fidoControlPointLength **之前**：实测客户端按 handle 升序遍历，
-     * 读到第一个"它认识的"特征后就停下（日志里它只读 CPLength 就放弃，
-     * 且从不读 Bitfield，而规范要求"先检查 Bitfield 并写入版本位"）。
-     * 交换两者顺序后 Bitfield 的 handle 更小，客户端应能先遇到它。
-     * UUID 与属性均未改变，nRF Connect 手工验证不受影响。 */
-    {
-        {ATT_BT_UUID_SIZE, characterUUID},
-        GATT_PERMIT_READ,
-        0,
-        &s_RevBitfieldProps
-    },
-    {
-        {ATT_UUID_SIZE, fido_ServiceRevisionBitfieldUUID}, /* idx 7 */
-        GATT_PERMIT_READ | GATT_PERMIT_WRITE |
-            GATT_PERMIT_ENCRYPT_READ | GATT_PERMIT_ENCRYPT_WRITE,
-        0,
-        &s_RevBitfieldValue
     },
     /* ---- 特征 3: fidoControlPointLength (Read) ---- */
     {
@@ -217,10 +196,34 @@ static gattAttribute_t s_ProfileAttrTbl[] = {
         &s_CPLengthProps
     },
     {
-        {ATT_UUID_SIZE, fido_ControlPointLengthUUID},/* idx 9 */
+        {ATT_UUID_SIZE, fido_ControlPointLengthUUID},/* idx 7 */
         GATT_PERMIT_READ | GATT_PERMIT_ENCRYPT_READ,
         0,
         s_CPLengthValue
+    },
+    /* ---- 特征 4: fidoServiceRevisionBitfield (Read/Write) ----
+     *
+     * ★ 本特征排在 fidoControlPointLength **之后**（handle 更大）。
+     *
+     * 顺序调整过两轮，最终定为"CPlength 在前"：
+     *   规范 §11.4.6 的流程是"先检查 Bitfield 并写入版本位，再读 CPLength"，
+     *   曾据此把 Bitfield 排到前面（让它的 handle 更小）。
+     *   但实测客户端并不按规范流程走 —— Windows FIDO 栈按 handle 顺序
+     *   遍历，且读到 CPLength 之后仍然会继续（不再"读完一个就停"）。
+     *   故回到 CPLength 在前。
+     *
+     * UUID 与属性位均未改变，nRF Connect 手工验证不受影响。 */
+    {
+        {ATT_BT_UUID_SIZE, characterUUID},
+        GATT_PERMIT_READ,
+        0,
+        &s_RevBitfieldProps
+    },
+    {
+        {ATT_UUID_SIZE, fido_ServiceRevisionBitfieldUUID}, /* idx 9 */
+        GATT_PERMIT_READ | GATT_PERMIT_WRITE | GATT_PERMIT_ENCRYPT_READ | GATT_PERMIT_ENCRYPT_WRITE,
+        0,
+        &s_RevBitfieldValue
     },
 };
 
@@ -423,7 +426,7 @@ static bStatus_t fido_ReadAttrCB(uint16_t connHandle, gattAttribute_t *pAttr,
     }
 
     uuid = BUILD_UINT16(pAttr->type.uuid[0], pAttr->type.uuid[1]);
-
+    PRINT("%8x", uuid);
     if(uuid == GATT_CLIENT_CHAR_CFG_UUID)
     {
         if(offset != 0)
